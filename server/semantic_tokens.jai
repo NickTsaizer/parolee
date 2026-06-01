@@ -273,6 +273,22 @@ process_node :: (node: *Node, entries: *[..]Token_Entry, inside_struct: bool) {
             if dr.expression {
                 process_node(dr.expression, entries, inside_struct);
             }
+
+        case .CASE;
+            c := cast(*Case) node;
+            for member: c.members {
+                process_node(member, entries, inside_struct);
+            }
+
+        case .PROCEDURE_CALL;
+            pc := cast(*Procedure_Call) node;
+            if pc.procedure {
+                process_node(pc.procedure, entries, inside_struct);
+            }
+            // Also process arguments for any variable references
+            for arg: pc.arguments {
+                process_node(arg, entries, inside_struct);
+            }
     }
 }
 
@@ -384,7 +400,8 @@ node_to_token_type_and_modifiers :: (node: *Node, inside_struct: bool) -> u32, u
         case .CONTINUE; #through;
         case .DEFER; #through;
         case .REMOVE; #through;
-        case .CAST;
+        case .CAST; #through;
+        case .CASE;
             return TOKEN_TYPE_KEYWORD, 0, true;
 
         case .USING;
@@ -419,6 +436,7 @@ keyword_length_for_node :: (node: *Node) -> int {
         case .STRUCT; return 6;
         case .ENUM; return 4;
         case .UNION; return 5;
+        case .CASE; return 4;
     }
     return xx (node.location.c1 - node.location.c0); // fallback
 }
