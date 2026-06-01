@@ -155,15 +155,15 @@ emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
         length := compute_token_length(node, token_type);
         start_col := loc.c0;
 
-        // For binary operators, position is between left and right operands
+        // For binary operators, position is between left and right operands.
+        // Skip entirely if we can't determine position (e.g., compound left-hand sides).
         if token_type == TOKEN_TYPE_OPERATOR && node.kind == .BINARY_OPERATION {
             bin := cast(*Binary_Operation) node;
-            if bin.left && bin.right {
+            if bin.left && bin.right && bin.left.location.c1 > 0 && bin.right.location.c0 > bin.left.location.c1 {
                 start_col = bin.left.location.c1;
                 length = bin.right.location.c0 - bin.left.location.c1;
-                if length <= 0 { length = 0; }
             } else {
-                length = 0; // can't position correctly, skip
+                length = 0;
             }
         }
 
