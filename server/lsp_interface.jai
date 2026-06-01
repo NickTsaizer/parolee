@@ -402,14 +402,12 @@ LSP_Work_Done_Progess_Begin :: struct {
     title: string;
     cancellable: *bool;
     message: *string;
-    precentage: *u8;
 }
 
 LSP_Work_Done_Progress_Report :: struct {
     kind: string = "report";
     cancellable: *bool;
     message: *string;
-    precentage: *u8;
 }
 
 LSP_Work_Done_Progress_Done :: struct {
@@ -426,16 +424,12 @@ LSP_Progress_Notification :: struct(Value_Type: Type) {
     };
 }
 
-send_progress_begin :: (token: string, title: string, message := "", percentage := -1) {
+send_progress_begin :: (token: string, title: string, message := "") {
     begin: LSP_Work_Done_Progess_Begin;
     begin.title = title;
     if message.count > 0 {
         msg := message;
         begin.message = *msg;
-    }
-    if percentage >= 0 {
-        pct: u8 = xx percentage;
-        begin.precentage = *pct;
     }
     notif: LSP_Progress_Notification(LSP_Work_Done_Progess_Begin);
     notif.params.token = token;
@@ -443,17 +437,11 @@ send_progress_begin :: (token: string, title: string, message := "", percentage 
     lsp_send(notif);
 }
 
-send_progress_report :: (token: string, message := "", percentage := -1) {
+send_progress_report :: (token: string, message := "") {
     report: LSP_Work_Done_Progress_Report;
     if message.count > 0 {
         msg := message;
         report.message = *msg;
-    }
-    if percentage >= 0 {
-        p := percentage;
-        if p > 100 p = 100;
-        pct: u8 = xx p;
-        report.precentage = *pct;
     }
     notif: LSP_Progress_Notification(LSP_Work_Done_Progress_Report);
     notif.params.token = token;
