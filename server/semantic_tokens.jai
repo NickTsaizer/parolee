@@ -235,15 +235,54 @@ classify_node :: (node: *Node) -> u32, u32, bool {
 
             return token_type, modifiers, true;
 
-        // ── Identifiers (variable references, type names, etc.) ────
+        // ── Identifiers (context-sensitive) ───────────────────────
         case .IDENTIFIER;
             modifiers: u32 = 0;
 
-            // For-loop iteration variables
-            if parent && parent.kind == .FOR {
-                f := cast(*For) parent;
-                if node == f.value || node == f.index || node == f.iterator {
-                    modifiers = MODIFIER_DECLARATION;
+            if parent {
+                // Procedure call target → function
+                if parent.kind == .PROCEDURE_CALL {
+                    pc := cast(*Procedure_Call) parent;
+                    if pc.procedure == node {
+                        return TOKEN_TYPE_FUNCTION, 0, true;
+                    }
+                }
+
+                // Type reference (inside type annotation, cast, etc.)
+                if parent.kind == .TYPE_INSTANTIATION {
+                    return TOKEN_TYPE_TYPE, 0, true;
+                }
+
+                // For-loop iteration variables
+                if parent.kind == .FOR {
+                    f := cast(*For) parent;
+                    if node == f.value || node == f.index || node == f.iterator {
+                        modifiers = MODIFIER_DECLARATION;
+                    }
+                }
+            }
+
+            // Fallback: resolve what this identifier refers to via declaration lookup
+            {
+                ident := cast(*Identifier) node;
+                decls := get_identifier_decls(ident);
+                if decls.count > 0 {
+                    decl := decls[0];
+                    if decl.expression {
+                        if decl.expression.kind == .PROCEDURE {
+                            return TOKEN_TYPE_FUNCTION, 0, true;
+                        }
+                        if decl.expression.kind == .STRUCT || decl.expression.kind == .UNION {
+                            return TOKEN_TYPE_TYPE, 0, true;
+                        }
+                        if decl.expression.kind == .ENUM {
+                            return TOKEN_TYPE_TYPE, 0, true;
+                        }
+                    }
+                    // Enum member reference
+                    if decl.parent && decl.parent.kind == .ENUM {
+                        return TOKEN_TYPE_ENUM_MEMBER, 0, true;
+                    }
                 }
             }
 
