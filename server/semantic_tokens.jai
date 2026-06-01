@@ -153,6 +153,19 @@ emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
     if got {
         loc := node.location;
         length := compute_token_length(node, token_type);
+        start_col := loc.c0;
+
+        // For binary operators, position is between left and right operands
+        if token_type == TOKEN_TYPE_OPERATOR && node.kind == .BINARY_OPERATION {
+            bin := cast(*Binary_Operation) node;
+            if bin.left && bin.right {
+                start_col = bin.left.location.c1;
+                length = bin.right.location.c0 - bin.left.location.c1;
+                if length <= 0 { length = 0; }
+            } else {
+                length = 0; // can't position correctly, skip
+            }
+        }
 
         // Skip truly multi-line tokens (not declarations/keywords which we cap)
         if loc.l0 != loc.l1 && node.kind != .DECLARATION && token_type != TOKEN_TYPE_KEYWORD && token_type != TOKEN_TYPE_MACRO return;
@@ -160,7 +173,7 @@ emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
         if length > 0 {
             entry: Token_Entry;
             entry.line = xx loc.l0;
-            entry.character = xx loc.c0;
+            entry.character = xx start_col;
             entry.length = xx length;
             entry.token_type = token_type;
             entry.token_modifiers = modifiers;
@@ -508,7 +521,7 @@ compute_token_length :: (node: *Node, token_type: u32) -> int {
     }
     if token_type == TOKEN_TYPE_OPERATOR {
         loc := node.location;
-        return loc.c1 - loc.c0; // operators are single-line and well-sized
+        return loc.c1 - loc.c0; // fallback (binary ops handled in emit_token_for_node)
     }
     loc := node.location;
     return loc.c1 - loc.c0;
