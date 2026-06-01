@@ -150,23 +150,41 @@ emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
     if !node return;
 
     token_type, modifiers, got := classify_node(node);
-    if !got return;
+    if got {
+        loc := node.location;
+        length := compute_token_length(node, token_type);
 
-    loc := node.location;
-    length := compute_token_length(node, token_type);
+        // Skip truly multi-line tokens (not declarations/keywords which we cap)
+        if loc.l0 != loc.l1 && node.kind != .DECLARATION && token_type != TOKEN_TYPE_KEYWORD && token_type != TOKEN_TYPE_MACRO return;
 
-    // Skip truly multi-line tokens (not declarations/keywords which we cap)
-    if loc.l0 != loc.l1 && node.kind != .DECLARATION && token_type != TOKEN_TYPE_KEYWORD && token_type != TOKEN_TYPE_MACRO return;
+        if length > 0 {
+            entry: Token_Entry;
+            entry.line = xx loc.l0;
+            entry.character = xx loc.c0;
+            entry.length = xx length;
+            entry.token_type = token_type;
+            entry.token_modifiers = modifiers;
+            array_add(entries, entry);
+        }
+    }
 
-    if length <= 0 return;
-
-    entry: Token_Entry;
-    entry.line = xx loc.l0;
-    entry.character = xx loc.c0;
-    entry.length = xx length;
-    entry.token_type = token_type;
-    entry.token_modifiers = modifiers;
-    array_add(entries, entry);
+    // Emit declaration operator (:= or ::) as an operator token
+    if node.kind == .DECLARATION {
+        decl := cast(*Declaration) node;
+        op_col := decl.location.c0 + decl.name.count;
+        // Determine operator length: :: and := are 2 chars, : is 1 char
+        op_len := 2;
+        if !decl.const && decl.type_inst && !decl.expression {
+            op_len = 1; // type-only declaration uses single ':'
+        }
+        entry: Token_Entry;
+        entry.line = xx decl.location.l0;
+        entry.character = xx op_col;
+        entry.length = xx op_len;
+        entry.token_type = TOKEN_TYPE_OPERATOR;
+        entry.token_modifiers = 0;
+        array_add(entries, entry);
+    }
 }
 
 emit_comment_token :: (comment: Comment_Token, entries: *[..]Token_Entry) {
@@ -273,6 +291,14 @@ classify_node :: (node: *Node) -> u32, u32, bool {
                 if parent.kind == .CAST {
                     c := cast(*Cast) parent;
                     if c.cast_expression == node {
+                        return TOKEN_TYPE_TYPE, 0, true;
+                    }
+                }
+
+                // Type reference: array element type (e.g., `[..]Any`)
+                if parent.kind == .ARRAY_TYPE {
+                    at := cast(*Array_Type) parent;
+                    if at.element_type == node || at.dimension == node {
                         return TOKEN_TYPE_TYPE, 0, true;
                     }
                 }
