@@ -450,7 +450,9 @@ send_progress_report :: (token: string, message := "", percentage := -1) {
         report.message = *msg;
     }
     if percentage >= 0 {
-        pct: u8 = xx percentage;
+        p := percentage;
+        if p > 100 p = 100;
+        pct: u8 = xx p;
         report.precentage = *pct;
     }
     notif: LSP_Progress_Notification(LSP_Work_Done_Progress_Report);

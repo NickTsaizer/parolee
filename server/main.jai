@@ -542,6 +542,7 @@ main :: () {
             // Report progress
             if server.deferred_total > 0 {
                 pct := (server.deferred_processed * 100) / server.deferred_total;
+                if pct > 100 pct = 100;
                 send_progress_report("jails-parse", tprint("Parsed %", path), pct);
             }
         }
