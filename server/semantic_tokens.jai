@@ -202,6 +202,25 @@ emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
 
         emit_op_entry(op_col, op_len, last_member.location.l0, entries);
     }
+
+    // Emit string tokens for directive arguments (#import "Basic", #load "file.jai")
+    if node.kind == .DIRECTIVE_IMPORT {
+        di := cast(*Directive_Import) node;
+        if di.module.count > 0 {
+            // String at end of directive node span
+            str_start := node.location.c1 - di.module.count - 2;
+            str_len := di.module.count + 2;
+            emit_string_entry(str_start, str_len, node.location.l0, entries);
+        }
+    }
+    if node.kind == .DIRECTIVE_LOAD {
+        dl := cast(*Directive_Load) node;
+        if dl.file.count > 0 {
+            str_start := node.location.c1 - dl.file.count - 1;
+            str_len := dl.file.count + 2;
+            emit_string_entry(str_start, str_len, node.location.l0, entries);
+        }
+    }
 }
 
 emit_op_entry :: (col: int, len: int, line: int, entries: *[..]Token_Entry) {
@@ -210,6 +229,16 @@ emit_op_entry :: (col: int, len: int, line: int, entries: *[..]Token_Entry) {
     entry.character = xx col;
     entry.length = xx len;
     entry.token_type = TOKEN_TYPE_OPERATOR;
+    entry.token_modifiers = 0;
+    array_add(entries, entry);
+}
+
+emit_string_entry :: (col: int, len: int, line: int, entries: *[..]Token_Entry) {
+    entry: Token_Entry;
+    entry.line = xx line;
+    entry.character = xx col;
+    entry.length = xx len;
+    entry.token_type = TOKEN_TYPE_STRING;
     entry.token_modifiers = 0;
     array_add(entries, entry);
 }
