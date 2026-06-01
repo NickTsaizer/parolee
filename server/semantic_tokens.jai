@@ -174,23 +174,44 @@ emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
         op_col := decl.location.c0 + decl.name.count;
         op_len: int;
 
-        // Type-only (:): no space before operator, 1 char
-        // := or ::: space before operator, 2 chars
         if !decl.const && decl.type_inst && !decl.expression {
-            op_len = 1;  // type-only: "x: int" → just ":"
+            op_len = 1;
         } else {
-            op_col += 1; // skip space: "x := 42" or "x :: 42"
-            op_len = 2;  // "::" or ":="
+            op_col += 1;
+            op_len = 2;
         }
 
-        entry: Token_Entry;
-        entry.line = xx decl.location.l0;
-        entry.character = xx op_col;
-        entry.length = xx op_len;
-        entry.token_type = TOKEN_TYPE_OPERATOR;
-        entry.token_modifiers = 0;
-        array_add(entries, entry);
+        emit_op_entry(op_col, op_len, decl.location.l0, entries);
     }
+
+    if node.kind == .COMPOUND_DECLARATION {
+        cd := cast(*Compound_Declaration) node;
+        if cd.members.count == 0 return;
+
+        // Operator is after the last member name
+        last_member := cd.members[cd.members.count - 1];
+        op_col := last_member.location.c0 + (last_member.location.c1 - last_member.location.c0);
+        op_len: int;
+
+        if !cd.const && cd.type_inst && cd.type_inst.name.count > 0 {
+            op_len = 1; // type-only: "a, b: int"
+        } else {
+            op_col += 1;
+            op_len = 2; // "a, b := expr" or "a, b :: expr"
+        }
+
+        emit_op_entry(op_col, op_len, last_member.location.l0, entries);
+    }
+}
+
+emit_op_entry :: (col: int, len: int, line: int, entries: *[..]Token_Entry) {
+    entry: Token_Entry;
+    entry.line = xx line;
+    entry.character = xx col;
+    entry.length = xx len;
+    entry.token_type = TOKEN_TYPE_OPERATOR;
+    entry.token_modifiers = 0;
+    array_add(entries, entry);
 }
 
 emit_comment_token :: (comment: Comment_Token, entries: *[..]Token_Entry) {
