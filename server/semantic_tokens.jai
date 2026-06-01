@@ -1,8 +1,9 @@
 // Semantic Tokens — LSP semantic highlighting from AST + comments
 //
-// Walks the AST top-down from global_block.members and comments (file.comments),
-// maps each node/comment to an LSP semantic token type + modifiers,
-// sorts by source position, delta-encodes, and responds.
+// Iterates file.nodes (flat list of ALL AST nodes in parse order) and
+// file.comments (lexer comment buffer). Each node maps to an LSP token
+// type + modifiers. No recursion needed — file.nodes already contains
+// every node from the parse tree.
 //
 // Token type indices correspond to SEMANTIC_TOKEN_TYPES in lsp_interface.jai
 
@@ -42,6 +43,8 @@ Token_Entry :: struct {
     token_modifiers: u32;
 }
 
+// ── Handlers ──────────────────────────────────────────────────────────────
+
 handle_semantic_tokens_full :: (request: LSP_Request_Message_SemanticTokens) {
     push_allocator(temp);
 
@@ -56,11 +59,7 @@ handle_semantic_tokens_full :: (request: LSP_Request_Message_SemanticTokens) {
     }
 
     entries: [..]Token_Entry;
-    collect_node_tokens(file, *entries);
-    collect_comment_tokens(file, *entries);
-
-    // AST nodes are in source order; comments are in lexer order.
-    // Both are roughly sorted already. Run insertion sort to guarantee order.
+    collect_all_tokens(file, *entries);
     sort_token_entries(entries);
 
     // Deduplicate consecutive entries at same (line, character)
@@ -100,9 +99,20 @@ handle_semantic_tokens_range :: (request: LSP_Request_Message_SemanticTokens_Ran
     range := request.params.range;
 
     entries: [..]Token_Entry;
-    collect_node_tokens(file, *entries);
-    collect_comment_tokens(file, *entries);
+    collect_all_tokens(file, *entries);
     sort_token_entries(entries);
+
+    // Deduplicate
+    if entries.count > 1 {
+        write: int = 1;
+        for read: 1 .. entries.count - 1 {
+            if entries[read].line != entries[write - 1].line || entries[read].character != entries[write - 1].character {
+                entries[write] = entries[read];
+                write += 1;
+            }
+        }
+        entries.count = write;
+    }
 
     // Filter by range
     filtered: [..]Token_Entry;
@@ -123,209 +133,67 @@ handle_semantic_tokens_range :: (request: LSP_Request_Message_SemanticTokens_Ran
     lsp_respond(request.id, result);
 }
 
-// Walk the AST top-down from global block members and emit token entries.
-// Uses recursion, NOT the flat file.nodes list (which would double-process).
-collect_node_tokens :: (file: *Program_File, entries: *[..]Token_Entry) {
-    for node: file.global_block.members {
-        process_node(node, entries, false);
+// ── Token collection (flat iteration) ─────────────────────────────────────
+
+// Iterate ALL AST nodes (flat) + ALL comment tokens.
+// No recursion — file.nodes contains every parse tree node in source order.
+collect_all_tokens :: (file: *Program_File, entries: *[..]Token_Entry) {
+    for node: file.nodes {
+        emit_token_for_node(node, entries);
+    }
+    for comment: file.comments {
+        emit_comment_token(comment, entries);
     }
 }
 
-process_node :: (node: *Node, entries: *[..]Token_Entry, inside_struct: bool) {
+emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
     if !node return;
 
-    token_type, modifiers, got := node_to_token_type_and_modifiers(node, inside_struct);
-    if got {
-        loc := node.location;
-        length := loc.c1 - loc.c0;
+    token_type, modifiers, got := classify_node(node);
+    if !got return;
 
-        // For declarations, use actual name length (location spans full declaration)
-        if node.kind == .DECLARATION {
-            decl := cast(*Declaration) node;
-            length = decl.name.count;
-        }
+    loc := node.location;
+    length := compute_token_length(node, token_type);
 
-        // For keywords, use keyword text length (location spans keyword + expression)
-        if token_type == TOKEN_TYPE_KEYWORD {
-            length = keyword_length_for_node(node);
-        }
+    // Skip truly multi-line tokens (not declarations/keywords which we cap)
+    if loc.l0 != loc.l1 && node.kind != .DECLARATION && token_type != TOKEN_TYPE_KEYWORD && token_type != TOKEN_TYPE_MACRO return;
 
-        // Skip multi-line tokens — only highlight single-line names
-        // Exception: declarations (already capped to name) and keywords (already exact span)
-        if loc.l0 != loc.l1 && node.kind != .DECLARATION && token_type != TOKEN_TYPE_KEYWORD {
-            length = 0;
-        }
+    if length <= 0 return;
 
-        if length > 0 {
-            entry: Token_Entry;
-            entry.line = xx loc.l0;
-            entry.character = xx loc.c0;
-            entry.length = xx length;
-            entry.token_type = token_type;
-            entry.token_modifiers = modifiers;
-            array_add(entries, entry);
-        }
-    }
-
-    // Recurse into children that may contain semantic tokens.
-    if node.kind == {
-        case .DECLARATION;
-            decl := cast(*Declaration) node;
-            if decl.expression {
-                process_node(decl.expression, entries, inside_struct);
-            }
-
-        case .BLOCK;
-            block := cast(*Block) node;
-            for member: block.members {
-                process_node(member, entries, inside_struct);
-            }
-
-        case .STRUCT;
-            s := cast(*Struct) node;
-            if s.block {
-                for member: s.block.members {
-                    process_node(member, entries, true);
-                }
-            }
-            for param: s.polymorphic_arguments {
-                add_simple_entry(param, entries, TOKEN_TYPE_TYPE_PARAM, 0);
-            }
-
-        case .UNION;
-            u := cast(*Union) node;
-            if u.block {
-                for member: u.block.members {
-                    process_node(member, entries, true);
-                }
-            }
-            for param: u.polymorphic_arguments {
-                add_simple_entry(param, entries, TOKEN_TYPE_TYPE_PARAM, 0);
-            }
-
-        case .ENUM;
-            _enum := cast(*Enum) node;
-            if _enum.block {
-                for member: _enum.block.members {
-                    process_node(member, entries, true);
-                }
-            }
-
-        case .PROCEDURE;
-            proc := cast(*Procedure) node;
-            // Procedure arguments → parameter
-            for arg: proc.arguments {
-                add_simple_entry(arg, entries, TOKEN_TYPE_PARAMETER, 0);
-            }
-            // Returns
-            for ret: proc.returns {
-                if ret.expression {
-                    add_simple_entry(ret.expression, entries, TOKEN_TYPE_PARAMETER, 0);
-                }
-            }
-            // Recurse into body
-            if proc.body {
-                for member: proc.body.members {
-                    process_node(member, entries, inside_struct);
-                }
-            }
-
-        case .FOR;
-            f := cast(*For) node;
-            for field: *Node.[f.value, f.index, f.iterator] {
-                if field {
-                    add_simple_entry(field, entries, TOKEN_TYPE_VARIABLE, MODIFIER_DECLARATION);
-                }
-            }
-            if f.body && f.body.kind == .BLOCK {
-                for member: cast(*Block, f.body).members {
-                    process_node(member, entries, inside_struct);
-                }
-            }
-
-        case .WHILE;
-            w := cast(*While) node;
-            if w.body && w.body.kind == .BLOCK {
-                for member: cast(*Block, w.body).members {
-                    process_node(member, entries, inside_struct);
-                }
-            }
-
-        case .IF;
-            iff := cast(*If) node;
-            for branch: *Node.[iff._then, iff._else] {
-                if !branch continue;
-                block := ifx branch.kind == .BLOCK then cast(*Block) branch else null;
-                if !block continue;
-                for member: block.members {
-                    process_node(member, entries, inside_struct);
-                }
-            }
-
-        case .USING;
-            u := cast(*Using) node;
-            if u.expression {
-                process_node(u.expression, entries, inside_struct);
-            }
-
-        case .DIRECTIVE_RUN;
-            dr := cast(*Directive_Run) node;
-            if dr.expression {
-                process_node(dr.expression, entries, inside_struct);
-            }
-
-        case .CASE;
-            c := cast(*Case) node;
-            for member: c.members {
-                process_node(member, entries, inside_struct);
-            }
-
-        case .PROCEDURE_CALL;
-            pc := cast(*Procedure_Call) node;
-            if pc.procedure {
-                process_node(pc.procedure, entries, inside_struct);
-            }
-            // Also process arguments for any variable references
-            for arg: pc.arguments {
-                process_node(arg, entries, inside_struct);
-            }
-    }
+    entry: Token_Entry;
+    entry.line = xx loc.l0;
+    entry.character = xx loc.c0;
+    entry.length = xx length;
+    entry.token_type = token_type;
+    entry.token_modifiers = modifiers;
+    array_add(entries, entry);
 }
 
-// Collect comment tokens from the lexer's comment buffer.
-collect_comment_tokens :: (file: *Program_File, entries: *[..]Token_Entry) {
-    for comment: file.comments {
-        // Token fields are accessible directly via #as using
-        if comment.l0 != comment.l1 continue; // Skip multi-line comments
+emit_comment_token :: (comment: Comment_Token, entries: *[..]Token_Entry) {
+    if comment.l0 != comment.l1 return; // Skip multi-line
 
-        entry: Token_Entry;
-        entry.line = xx comment.l0;
-        entry.character = xx comment.c0;
-        entry.length = xx (comment.c1 - comment.c0);
-        entry.token_type = TOKEN_TYPE_COMMENT;
-        entry.token_modifiers = 0;
-        array_add(entries, entry);
-    }
+    entry: Token_Entry;
+    entry.line = xx comment.l0;
+    entry.character = xx comment.c0;
+    entry.length = xx (comment.c1 - comment.c0);
+    entry.token_type = TOKEN_TYPE_COMMENT;
+    entry.token_modifiers = 0;
+    array_add(entries, entry);
 }
 
-// Map a single AST node to its semantic token type and modifier bits.
-// Returns (token_type, modifiers, should_emit).
-node_to_token_type_and_modifiers :: (node: *Node, inside_struct: bool) -> u32, u32, bool {
+// ── Node classification ───────────────────────────────────────────────────
+
+// Map any AST node to (token_type, modifier_bits, should_emit).
+// Uses parent chain for context (parameter detection, etc.)
+classify_node :: (node: *Node) -> u32, u32, bool {
+    parent := node.parent;
+
     if node.kind == {
+        // ── Declarations: function / struct / enum / variable ──────
         case .DECLARATION;
             decl := cast(*Declaration) node;
             modifiers: u32 = MODIFIER_DECLARATION;
-            if decl.const {
-                modifiers |= MODIFIER_READONLY;
-            }
-            if decl.notes {
-                for note: decl.notes {
-                    if contains(note.value, "deprecated") {
-                        modifiers |= MODIFIER_DEPRECATED;
-                        break;
-                    }
-                }
-            }
+            if decl.const { modifiers |= MODIFIER_READONLY; }
 
             token_type: u32;
             if decl.expression {
@@ -337,27 +205,71 @@ node_to_token_type_and_modifiers :: (node: *Node, inside_struct: bool) -> u32, u
                     token_type = TOKEN_TYPE_STRUCT;
                 } else if decl.expression.kind == .ENUM {
                     token_type = TOKEN_TYPE_ENUM;
-                } else if inside_struct {
-                    token_type = TOKEN_TYPE_PROPERTY;
                 } else {
                     token_type = TOKEN_TYPE_VARIABLE;
                 }
-            } else if inside_struct {
-                token_type = TOKEN_TYPE_PROPERTY;
             } else {
                 token_type = TOKEN_TYPE_VARIABLE;
             }
 
+            // Override: procedure arguments → parameter
+            if parent && parent.kind == .PROCEDURE {
+                proc := cast(*Procedure) parent;
+                for arg: proc.arguments {
+                    if arg == node { token_type = TOKEN_TYPE_PARAMETER; break; }
+                }
+                for ret: proc.returns {
+                    if ret.expression == node { token_type = TOKEN_TYPE_PARAMETER; break; }
+                }
+            }
+
+            // Override: enum members → enumMember
+            if parent && parent.kind == .ENUM {
+                token_type = TOKEN_TYPE_ENUM_MEMBER;
+            }
+
+            // Override: struct/union members → property
+            if parent && (parent.kind == .STRUCT || parent.kind == .UNION) {
+                token_type = TOKEN_TYPE_PROPERTY;
+            }
+
             return token_type, modifiers, true;
 
+        // ── Identifiers (variable references, type names, etc.) ────
         case .IDENTIFIER;
-            ident := cast(*Identifier) node;
-            // Skip identifiers that are part of larger expressions (handled by parent)
-            return TOKEN_TYPE_VARIABLE, 0, true;
+            modifiers: u32 = 0;
 
+            // For-loop iteration variables
+            if parent && parent.kind == .FOR {
+                f := cast(*For) parent;
+                if node == f.value || node == f.index || node == f.iterator {
+                    modifiers = MODIFIER_DECLARATION;
+                }
+            }
+
+            return TOKEN_TYPE_VARIABLE, modifiers, true;
+
+        // ── Literals: string / number / bool ───────────────────────
+        case .LITERAL;
+            lit := cast(*Literal) node;
+            if lit.value_type == {
+                case .STRING;
+                    return TOKEN_TYPE_STRING, 0, true;
+                case .INT; #through;
+                case .FLOAT;
+                    return TOKEN_TYPE_NUMBER, 0, true;
+            }
+            return 0, 0, false; // bool, array, struct literals → skip
+
+        // ── Comments (AST comment nodes, not lexer comments) ───────
+        case .COMMENT;
+            return TOKEN_TYPE_COMMENT, 0, true;
+
+        // ── Notes (@deprecated, etc.) ──────────────────────────────
         case .NOTE;
             return TOKEN_TYPE_DECORATOR, 0, true;
 
+        // ── Directives → macro ─────────────────────────────────────
         case .DIRECTIVE_IMPORT; #through;
         case .DIRECTIVE_LOAD; #through;
         case .DIRECTIVE_RUN; #through;
@@ -389,9 +301,16 @@ node_to_token_type_and_modifiers :: (node: *Node, inside_struct: bool) -> u32, u
         case .DIRECTIVE_FILEPATH; #through;
         case .DIRECTIVE_LINE; #through;
         case .DIRECTIVE_THROUGH; #through;
-        case .DIRECTIVE_SCOPE;
+        case .DIRECTIVE_SCOPE; #through;
+        case .DIRECTIVE_CHAR; #through;
+        case .DIRECTIVE_COMPILE_TIME; #through;
+        case .DIRECTIVE_DISCARD; #through;
+        case .DIRECTIVE_EXISTS; #through;
+        case .DIRECTIVE_CONTEXT; #through;
+        case .DIRECTIVE_STRING;
             return TOKEN_TYPE_MACRO, 0, true;
 
+        // ── Keywords ───────────────────────────────────────────────
         case .RETURN; #through;
         case .FOR; #through;
         case .WHILE; #through;
@@ -401,26 +320,55 @@ node_to_token_type_and_modifiers :: (node: *Node, inside_struct: bool) -> u32, u
         case .DEFER; #through;
         case .REMOVE; #through;
         case .CAST; #through;
-        case .CASE;
-            return TOKEN_TYPE_KEYWORD, 0, true;
-
-        case .USING;
-            return TOKEN_TYPE_KEYWORD, 0, true;
-
-        case .STRUCT;
-            return TOKEN_TYPE_KEYWORD, 0, true;
-
-        case .ENUM;
-            return TOKEN_TYPE_KEYWORD, 0, true;
-
+        case .CASE; #through;
+        case .USING; #through;
+        case .STRUCT; #through;
+        case .ENUM; #through;
         case .UNION;
             return TOKEN_TYPE_KEYWORD, 0, true;
+
+        // ── Operators ──────────────────────────────────────────────
+        case .BINARY_OPERATION; #through;
+        case .UNARY_OPERATION;
+            return TOKEN_TYPE_OPERATOR, 0, true;
+
+        // ── Operator overload (keyword 'operator') ─────────────────
+        case .OPERATOR_OVERLOAD;
+            return TOKEN_TYPE_KEYWORD, 0, true;
+
+        // ── Inline assembly ────────────────────────────────────────
+        case .INLINE_ASSEMBLY;
+            return TOKEN_TYPE_KEYWORD, 0, true;
+
+        // ── Quick lambda '->' ──────────────────────────────────────
+        case .QUICK_LAMBDA;
+            return TOKEN_TYPE_OPERATOR, 0, true;
     }
 
     return 0, 0, false;
 }
 
-// Return the length of a keyword token (just the keyword itself, not the expression).
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+compute_token_length :: (node: *Node, token_type: u32) -> int {
+    if node.kind == .DECLARATION {
+        decl := cast(*Declaration) node;
+        return decl.name.count;
+    }
+    if token_type == TOKEN_TYPE_KEYWORD {
+        return keyword_length_for_node(node);
+    }
+    if token_type == TOKEN_TYPE_MACRO {
+        return macro_length_for_node(node);
+    }
+    if token_type == TOKEN_TYPE_OPERATOR {
+        loc := node.location;
+        return loc.c1 - loc.c0; // operators are single-line and well-sized
+    }
+    loc := node.location;
+    return loc.c1 - loc.c0;
+}
+
 keyword_length_for_node :: (node: *Node) -> int {
     if node.kind == {
         case .RETURN; return 6;
@@ -437,34 +385,20 @@ keyword_length_for_node :: (node: *Node) -> int {
         case .ENUM; return 4;
         case .UNION; return 5;
         case .CASE; return 4;
+        case .OPERATOR_OVERLOAD; return 8;
+        case .INLINE_ASSEMBLY; return 6;
     }
-    return xx (node.location.c1 - node.location.c0); // fallback
-}
-
-// Add a simple one-node entry (used for parameters, polymorphic args, etc.)
-add_simple_entry :: (node: *Node, entries: *[..]Token_Entry, token_type: u32, modifiers: u32) {
-    if !node return;
     loc := node.location;
-    length := loc.c1 - loc.c0;
-
-    // Use actual name length for declarations
-    if node.kind == .DECLARATION {
-        decl := cast(*Declaration) node;
-        length = decl.name.count;
-    }
-
-    if length <= 0 return;
-
-    entry: Token_Entry;
-    entry.line = xx loc.l0;
-    entry.character = xx loc.c0;
-    entry.length = xx length;
-    entry.token_type = token_type;
-    entry.token_modifiers = modifiers;
-    array_add(entries, entry);
+    return loc.c1 - loc.c0;
 }
 
-// Insertion sort — simple but fine for the typical token count per file.
+macro_length_for_node :: (node: *Node) -> int {
+    loc := node.location;
+    return loc.c1 - loc.c0;
+}
+
+// ── Sorting & dedup ────────────────────────────────────────────────────────
+
 sort_token_entries :: (entries: []Token_Entry) {
     for i: 1 .. entries.count - 1 {
         key := entries[i];
@@ -483,7 +417,8 @@ token_entry_less :: (a: Token_Entry, b: Token_Entry) -> bool {
     return a.character < b.character;
 }
 
-// LSP delta encoding: [deltaLine, deltaStart, length, tokenType, tokenModifiers] per token
+// ── Delta encoding ─────────────────────────────────────────────────────────
+
 delta_encode_tokens :: (entries: []Token_Entry, out: *[..]int) {
     prev_line: int = 0;
     prev_char: int = 0;
