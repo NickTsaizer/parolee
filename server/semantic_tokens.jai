@@ -248,9 +248,33 @@ classify_node :: (node: *Node) -> u32, u32, bool {
                     }
                 }
 
-                // Type reference (inside type annotation, cast, etc.)
+                // Type reference: wrapped in TYPE_INSTANTIATION
                 if parent.kind == .TYPE_INSTANTIATION {
                     return TOKEN_TYPE_TYPE, 0, true;
+                }
+
+                // Type reference: direct type_inst on a declaration (e.g., `x: int`)
+                if parent.kind == .DECLARATION {
+                    decl := cast(*Declaration) parent;
+                    if decl.type_inst == node {
+                        return TOKEN_TYPE_TYPE, 0, true;
+                    }
+                }
+
+                // Type reference: return type (e.g., `-> bool`)
+                if parent.kind == .RETURN_VALUE {
+                    rv := cast(*Return_Value) parent;
+                    if rv.expression == node {
+                        return TOKEN_TYPE_TYPE, 0, true;
+                    }
+                }
+
+                // Type reference: cast target (e.g., `cast(s64)`)
+                if parent.kind == .CAST {
+                    c := cast(*Cast) parent;
+                    if c.cast_expression == node {
+                        return TOKEN_TYPE_TYPE, 0, true;
+                    }
                 }
 
                 // For-loop iteration variables
