@@ -31,6 +31,8 @@ Server :: struct {
     // Deferred parsing: imports queued for background resolution
     shallow_parse: bool;
     deferred_imports: [..]string;
+    deferred_total: int;       // total queued for percentage calc
+    deferred_processed: int;
     needs_reanalyze: bool;
 
     memory_files_lock: Mutex;
@@ -525,17 +527,32 @@ main :: () {
 
         // Process one deferred import per message cycle (background resolution)
         if server.deferred_imports.count > 0 {
+            // Capture total on first import
+            if server.deferred_processed == 0 {
+                server.deferred_total = server.deferred_imports.count;
+                send_progress_begin("jails-parse", "Indexing project...", tprint("% imports queued", server.deferred_total), 0);
+            }
+
             path := server.deferred_imports[0];
             array_ordered_remove_by_index(*server.deferred_imports, 0);
             parse_file(path);
+            server.deferred_processed += 1;
             server.needs_reanalyze = true;
-            log("Background parse: %", path);
+
+            // Report progress
+            if server.deferred_total > 0 {
+                pct := (server.deferred_processed * 100) / server.deferred_total;
+                send_progress_report("jails-parse", tprint("Parsed %", path), pct);
+            }
         }
 
         // Re-analyze when all deferred imports are done
         if server.needs_reanalyze && server.deferred_imports.count == 0 {
             server.needs_reanalyze = false;
             analyze_files();
+            send_progress_end("jails-parse", "Indexing complete");
+            server.deferred_total = 0;
+            server.deferred_processed = 0;
             log("Background analysis complete");
         }
 
