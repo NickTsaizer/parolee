@@ -492,7 +492,7 @@ LSP_Request_Message_Initialize :: struct {
 
 LSP_Result_Initialize :: struct {
     capabilities: struct {
-        //semanticTokensProvider := true;
+        semanticTokensProvider := SEMANTIC_TOKENS_PROVIDER;
         documentSymbolProvider := true;
         workspaceSymbolProvider := true;
 
@@ -635,6 +635,85 @@ LSP_Hover :: struct {
     contents: string;
     contentFormat:= "markdown";
 }
+
+/* Semantic Tokens */
+
+SEMANTIC_TOKEN_TYPES :: string.[
+    "namespace",   // 0
+    "type",        // 1  - struct/enum/union names used as types
+    "class",       // 2  (unused in Jai)
+    "enum",        // 3
+    "interface",   // 4  (unused in Jai)
+    "struct",      // 5
+    "typeParameter",// 6 - polymorphic type arguments
+    "parameter",   // 7  - procedure parameters
+    "variable",    // 8  - local/global variables
+    "property",    // 9  - struct/union fields
+    "enumMember",  // 10
+    "function",    // 11 - procedures
+    "method",      // 12 (unused in Jai)
+    "macro",       // 13 - directives (#import, #run, etc.)
+    "keyword",     // 14 - return, for, if, using, etc.
+    "modifier",    // 15 - inline, no_context, etc.
+    "comment",     // 16
+    "string",      // 17
+    "number",      // 18
+    "operator",    // 19
+    "decorator",   // 20 - @note annotations
+];
+
+SEMANTIC_TOKEN_MODIFIERS :: string.[
+    "declaration",   // 0
+    "definition",    // 1
+    "readonly",      // 2 - const variables
+    "static",        // 3
+    "deprecated",    // 4
+    "abstract",      // 5
+    "async",         // 6
+    "modification",  // 7
+    "documentation", // 8
+    "defaultLibrary",// 9 - Jai standard library
+];
+
+LSP_SemanticTokensLegend :: struct {
+    tokenTypes: []string;
+    tokenModifiers: []string;
+}
+
+LSP_SemanticTokensProvider :: struct {
+    legend: LSP_SemanticTokensLegend;
+    full: bool;
+    range: bool;
+}
+
+LSP_SemanticTokens :: struct {
+    resultId: string;
+    data: []int;
+}
+
+LSP_Request_Message_SemanticTokens :: struct {
+    using request: LSP_Request_Message;
+    params: struct {
+        textDocument: LSP_Text_Document_Identifier;
+    }
+}
+
+LSP_Request_Message_SemanticTokens_Range :: struct {
+    using request: LSP_Request_Message;
+    params: struct {
+        textDocument: LSP_Text_Document_Identifier;
+        range: LSP_Range;
+    }
+}
+
+SEMANTIC_TOKENS_PROVIDER :: LSP_SemanticTokensProvider.{
+    legend = LSP_SemanticTokensLegend.{
+        tokenTypes = SEMANTIC_TOKEN_TYPES,
+        tokenModifiers = SEMANTIC_TOKEN_MODIFIERS,
+    },
+    full = true,
+    range = false,
+};
 
 LSP_Folding_Range_Client_Capabilities :: struct {
     dynamicRegistration: *bool;

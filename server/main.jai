@@ -459,6 +459,24 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             // }
 
             // handle_hover(body);
+
+        case "textDocument/semanticTokens/full";
+            success, body := json_parse_string(raw_request, LSP_Request_Message_SemanticTokens,, temp);
+            if !success {
+                log_error("Unable to parse textDocument/semanticTokens/full message");
+                return;
+            }
+
+            handle_semantic_tokens_full(body);
+
+        case "textDocument/semanticTokens/range";
+            success, body := json_parse_string(raw_request, LSP_Request_Message_SemanticTokens_Range,, temp);
+            if !success {
+                log_error("Unable to parse textDocument/semanticTokens/range message");
+                return;
+            }
+
+            handle_semantic_tokens_range(body);
     }
 }
 
@@ -545,6 +563,7 @@ main :: () {
 #load "signature_help.jai";
 #load "hover.jai";
 #load "symbols.jai";
+#load "semantic_tokens.jai";
 #load "utils.jai";
 
 #if OS == .WINDOWS {
