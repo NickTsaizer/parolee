@@ -298,9 +298,12 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
 
         if server.shallow_parse {
             // Defer import parsing: collect path for background resolution
-            // Copy path string — original is temp-allocated and freed after request
+            // Copy using default allocator — current context is pool, freed on re-parse
             if path.count > 0 {
+                saved := context.allocator;
+                context.allocator = context.default_allocator;
                 array_add_if_unique(*server.deferred_imports, copy_string(path));
+                context.allocator = saved;
             }
         } else {
             parse_file(path); // @TODO: Run this in another thread?
@@ -332,7 +335,10 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
         load_relative_path := join(data.path_without_filename, _load.file, separator="/");
         array_add(*data.file.loads, _load);
         if server.shallow_parse {
+            saved := context.allocator;
+            context.allocator = context.default_allocator;
             array_add_if_unique(*server.deferred_imports, copy_string(load_relative_path));
+            context.allocator = saved;
         } else {
             parse_file(load_relative_path); // @TODO: Run this in another thread?
         }
