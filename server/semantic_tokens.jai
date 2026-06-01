@@ -168,15 +168,21 @@ emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
         }
     }
 
-    // Emit declaration operator (:= or ::) as an operator token
+    // Emit declaration operator (:=, ::, or :) as an operator token
     if node.kind == .DECLARATION {
         decl := cast(*Declaration) node;
         op_col := decl.location.c0 + decl.name.count;
-        // Determine operator length: :: and := are 2 chars, : is 1 char
-        op_len := 2;
+        op_len: int;
+
+        // Type-only (:): no space before operator, 1 char
+        // := or ::: space before operator, 2 chars
         if !decl.const && decl.type_inst && !decl.expression {
-            op_len = 1; // type-only declaration uses single ':'
+            op_len = 1;  // type-only: "x: int" → just ":"
+        } else {
+            op_col += 1; // skip space: "x := 42" or "x :: 42"
+            op_len = 2;  // "::" or ":="
         }
+
         entry: Token_Entry;
         entry.line = xx decl.location.l0;
         entry.character = xx op_col;
