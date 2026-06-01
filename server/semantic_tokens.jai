@@ -267,6 +267,12 @@ process_node :: (node: *Node, entries: *[..]Token_Entry, inside_struct: bool) {
             if u.expression {
                 process_node(u.expression, entries, inside_struct);
             }
+
+        case .DIRECTIVE_RUN;
+            dr := cast(*Directive_Run) node;
+            if dr.expression {
+                process_node(dr.expression, entries, inside_struct);
+            }
     }
 }
 
