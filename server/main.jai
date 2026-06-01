@@ -323,24 +323,11 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             log("Server.roots: %", server.roots);
             log("Server.intermediate_path: %", server.intermediate_path);
 
-            for root: server.roots {
-                absolute_path: string;
-                if starts_with(root, "/") {
-                    absolute_path = root;
-                } else {
-                    absolute_path = join(server.project_root, root, separator="/",, temp);
-                }
-
-                absolute_path = normalize_path(absolute_path,, temp);
-                parse_file(absolute_path, true);
-            }
-
-            // Parse Runtime Support and Preload
+            // Parse Runtime Support and Preload (needed for built-in type resolution)
             {
                 parse_file(tprint("%/modules/Runtime_Support.jai", server.args.jai_path), true);
                 parse_file(tprint("%/modules/Preload.jai", server.args.jai_path), true);
             }
-
 
             analyze_files();
 
