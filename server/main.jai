@@ -527,10 +527,9 @@ main :: () {
 
         // Process one deferred import per message cycle (background resolution)
         if server.deferred_imports.count > 0 {
-            // Capture total on first import
+            // Capture total on first import — only notify if substantial
             if server.deferred_processed == 0 {
                 server.deferred_total = server.deferred_imports.count;
-                send_progress_begin("jails-parse", "Indexing project...", tprint("% imports queued", server.deferred_total));
             }
 
             path := server.deferred_imports[0];
@@ -538,15 +537,12 @@ main :: () {
             parse_file(path);
             server.deferred_processed += 1;
             server.needs_reanalyze = true;
-
-                send_progress_report("jails-parse", tprint("Parsed %", path));
         }
 
         // Re-analyze when all deferred imports are done
         if server.needs_reanalyze && server.deferred_imports.count == 0 {
             server.needs_reanalyze = false;
             analyze_files();
-            send_progress_end("jails-parse", "Indexing complete");
             server.deferred_total = 0;
             server.deferred_processed = 0;
             log("Background analysis complete");
