@@ -151,7 +151,8 @@ process_node :: (node: *Node, entries: *[..]Token_Entry, inside_struct: bool) {
         }
 
         // Skip multi-line tokens — only highlight single-line names
-        if loc.l0 != loc.l1 && node.kind != .DECLARATION {
+        // Exception: declarations (already capped to name) and keywords (already exact span)
+        if loc.l0 != loc.l1 && node.kind != .DECLARATION && token_type != TOKEN_TYPE_KEYWORD {
             length = 0;
         }
 
