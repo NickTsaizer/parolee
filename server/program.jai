@@ -296,7 +296,14 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
             array_add(*data.file.imports, module_import);
         }
 
-        parse_file(path); // @TODO: Run this in another thread?
+        if server.shallow_parse {
+            // Defer import parsing: collect path for background resolution
+            if path.count > 0 {
+                array_add_if_unique(*server.deferred_imports, path);
+            }
+        } else {
+            parse_file(path); // @TODO: Run this in another thread?
+        }
     }
 
     if node.kind == .USING {
@@ -323,7 +330,11 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
 
         load_relative_path := join(data.path_without_filename, _load.file, separator="/");
         array_add(*data.file.loads, _load);
-        parse_file(load_relative_path); // @TODO: Run this in another thread?
+        if server.shallow_parse {
+            array_add_if_unique(*server.deferred_imports, load_relative_path);
+        } else {
+            parse_file(load_relative_path); // @TODO: Run this in another thread?
+        }
     }
 
     if !node.parent {

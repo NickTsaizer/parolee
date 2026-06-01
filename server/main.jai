@@ -28,6 +28,11 @@ Server :: struct {
     files: Table(string, *Program_File);
     files_to_be_analyzed: [..]*Program_File;
 
+    // Deferred parsing: imports queued for background resolution
+    shallow_parse: bool;
+    deferred_imports: [..]string;
+    needs_reanalyze: bool;
+
     memory_files_lock: Mutex;
     memory_files: Table(string, [..]u8); // @todo: This is probably dumb - store files as array of lines instead (is this good idea?) // @ToDo: Keep track of a modified flag per file
 
@@ -370,7 +375,12 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             create_memory_file(file_path, content);
 
-            parse_file(file_path);
+            // Shallow parse: current file only, imports deferred to background
+            server.shallow_parse = true;
+            parse_file(file_path, true);
+            server.shallow_parse = false;
+            server.needs_reanalyze = false;
+
             analyze_files();
             run_diagnostics();
 
@@ -385,7 +395,9 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
             edit_memory_file(file_path, body.params.contentChanges);
+            server.shallow_parse = true;
             parse_file(file_path, true);
+            server.shallow_parse = false;
             analyze_files();
 
         case "textDocument/documentSymbol";
@@ -510,6 +522,22 @@ main :: () {
         }
 
         handle_request(request, body);
+
+        // Process one deferred import per message cycle (background resolution)
+        if server.deferred_imports.count > 0 {
+            path := server.deferred_imports[0];
+            array_ordered_remove_by_index(*server.deferred_imports, 0);
+            parse_file(path);
+            server.needs_reanalyze = true;
+            log("Background parse: %", path);
+        }
+
+        // Re-analyze when all deferred imports are done
+        if server.needs_reanalyze && server.deferred_imports.count == 0 {
+            server.needs_reanalyze = false;
+            analyze_files();
+            log("Background analysis complete");
+        }
 
         reset_temporary_storage();
         #if MEMORY_DEBUG report_memory_leaks();
