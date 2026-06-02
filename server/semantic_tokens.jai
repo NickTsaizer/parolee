@@ -372,6 +372,18 @@ classify_node :: (node: *Node) -> u32, u32, bool {
                     }
                 }
 
+                // Pointer type prefix (e.g., `*NSWindow` in cast context, not `*ptr` deref)
+                if parent.kind == .UNARY_OPERATION {
+                    u := cast(*Unary_Operation) parent;
+                    if u.expression == node {
+                        // Only type if in type context (cast, decl type_inst, return type, array element)
+                        gp := u.parent;
+                        if gp && (gp.kind == .CAST || gp.kind == .DECLARATION || gp.kind == .RETURN_VALUE || gp.kind == .ARRAY_TYPE) {
+                            return TOKEN_TYPE_TYPE, 0, true;
+                        }
+                    }
+                }
+
                 // For-loop iteration variables
                 if parent.kind == .FOR {
                     f := cast(*For) parent;
