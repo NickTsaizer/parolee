@@ -331,6 +331,13 @@ is_in_type_position :: (node: *Node, parent: *Node) -> bool {
         at := cast(*Array_Type) parent;
         if at.element_type == node || at.dimension == node return true;
     }
+    // Struct literal prefix: Type.{} — left of dot is type, right is struct literal
+    if parent.kind == .BINARY_OPERATION {
+        bin := cast(*Binary_Operation) parent;
+        if bin.operation == .DOT && bin.left == node && bin.right && bin.right.kind != .IDENTIFIER {
+            return true;
+        }
+    }
     if parent.kind == .UNARY_OPERATION {
         u := cast(*Unary_Operation) parent;
         if u.expression == node {
@@ -415,7 +422,18 @@ classify_node :: (node: *Node) -> u32, u32, bool {
                     }
                     if decl.parent && decl.parent.kind == .ENUM return TOKEN_TYPE_ENUM_MEMBER, 0, true;
                 }
-                return TOKEN_TYPE_VARIABLE, mod, true;
+    // Heuristic: uppercase-first identifiers are likely types (Type.{}, Type.field, etc.)
+    {
+        ident := cast(*Identifier) node;
+        if ident.name.count > 0 {
+            c := ident.name[0];
+            if c >= #char "A" && c <= #char "Z" {
+                return TOKEN_TYPE_TYPE, 0, true;
+            }
+        }
+    }
+
+    return TOKEN_TYPE_VARIABLE, mod, true;
             }
 
         case .LITERAL;
