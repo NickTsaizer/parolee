@@ -62,7 +62,7 @@ handle_semantic_tokens_full :: (request: LSP_Request_Message_SemanticTokens) {
     collect_all_tokens(file, *entries);
     sort_token_entries(entries);
 
-    // Deduplicate consecutive entries at same (line, character)
+    // Dedup
     if entries.count > 1 {
         write: int = 1;
         for read: 1 .. entries.count - 1 {
@@ -74,13 +74,7 @@ handle_semantic_tokens_full :: (request: LSP_Request_Message_SemanticTokens) {
         entries.count = write;
     }
 
-    encoded: [..]int;
-    delta_encode_tokens(entries, *encoded);
-
-    result: LSP_SemanticTokens;
-    result.data = encoded;
-
-    lsp_respond(request.id, result);
+    delta_encode_and_respond(entries, request.id);
 }
 
 handle_semantic_tokens_range :: (request: LSP_Request_Message_SemanticTokens_Range) {
@@ -102,18 +96,6 @@ handle_semantic_tokens_range :: (request: LSP_Request_Message_SemanticTokens_Ran
     collect_all_tokens(file, *entries);
     sort_token_entries(entries);
 
-    // Deduplicate
-    if entries.count > 1 {
-        write: int = 1;
-        for read: 1 .. entries.count - 1 {
-            if entries[read].line != entries[write - 1].line || entries[read].character != entries[write - 1].character {
-                entries[write] = entries[read];
-                write += 1;
-            }
-        }
-        entries.count = write;
-    }
-
     // Filter by range
     filtered: [..]Token_Entry;
     for entry: entries {
@@ -124,430 +106,113 @@ handle_semantic_tokens_range :: (request: LSP_Request_Message_SemanticTokens_Ran
         array_add(*filtered, entry);
     }
 
+    delta_encode_and_respond(filtered, request.id);
+}
+
+delta_encode_and_respond :: (entries: []Token_Entry, id: JSON_Value) {
     encoded: [..]int;
-    delta_encode_tokens(filtered, *encoded);
+    prev_line: int = 0;
+    prev_char: int = 0;
+
+    for entry: entries {
+        delta_line := xx entry.line - prev_line;
+        if delta_line == 0 {
+            delta_char := xx entry.character - prev_char;
+            array_add(*encoded, 0);
+            array_add(*encoded, delta_char);
+        } else {
+            array_add(*encoded, delta_line);
+            array_add(*encoded, xx entry.character);
+        }
+
+        array_add(*encoded, xx entry.length);
+        array_add(*encoded, xx entry.token_type);
+        array_add(*encoded, xx entry.token_modifiers);
+
+        prev_line = xx entry.line;
+        prev_char = xx entry.character;
+    }
 
     result: LSP_SemanticTokens;
     result.data = encoded;
-
-    lsp_respond(request.id, result);
+    lsp_respond(id, result);
 }
 
-// ── Token collection (flat iteration) ─────────────────────────────────────
+// ── Token collection ─────────────────────────────────────────────────────
 
-// Iterate ALL AST nodes (flat) + ALL comment tokens.
-// No recursion — file.nodes contains every parse tree node in source order.
 collect_all_tokens :: (file: *Program_File, entries: *[..]Token_Entry) {
     for node: file.nodes {
-        emit_token_for_node(node, entries);
+        emit_node_token(node, entries);
     }
     for comment: file.comments {
-        emit_comment_token(comment, entries);
+        if comment.l0 == comment.l1 { // skip multi-line
+            entry: Token_Entry;
+            entry.line = xx comment.l0;
+            entry.character = xx comment.c0;
+            entry.length = xx (comment.c1 - comment.c0);
+            entry.token_type = TOKEN_TYPE_COMMENT;
+            entry.token_modifiers = 0;
+            array_add(entries, entry);
+        }
     }
 }
 
-emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
+emit_node_token :: (node: *Node, entries: *[..]Token_Entry) {
     if !node return;
 
     token_type, modifiers, got := classify_node(node);
     if got {
-        loc := node.location;
-        length := compute_token_length(node, token_type);
-        start_col := loc.c0;
-
-        // For binary/unary operators, position is between operands or at operator char
-        if token_type == TOKEN_TYPE_OPERATOR && node.kind == .BINARY_OPERATION {
-            bin := cast(*Binary_Operation) node;
-            if bin.left && bin.right && bin.left.location.c1 > 0 && bin.right.location.c0 > bin.left.location.c1 {
-                start_col = bin.left.location.c1;
-                length = bin.right.location.c0 - bin.left.location.c1;
-            } else {
-                length = 0;
-            }
-        }
-        if token_type == TOKEN_TYPE_OPERATOR && node.kind == .UNARY_OPERATION {
-            u := cast(*Unary_Operation) node;
-            if u.expression && u.expression.location.c0 > loc.c0 {
-                length = u.expression.location.c0 - loc.c0;
-            }
-        }
-
-        // Skip truly multi-line tokens (not declarations/keywords which we cap)
-        if loc.l0 != loc.l1 && node.kind != .DECLARATION && token_type != TOKEN_TYPE_KEYWORD && token_type != TOKEN_TYPE_MACRO return;
-
-        if length > 0 {
+        span := token_span(node, token_type);
+        if span.length > 0 {
             entry: Token_Entry;
-            entry.line = xx loc.l0;
-            entry.character = xx start_col;
-            entry.length = xx length;
+            entry.line = xx span.line;
+            entry.character = xx span.col;
+            entry.length = xx span.length;
             entry.token_type = token_type;
             entry.token_modifiers = modifiers;
             array_add(entries, entry);
         }
     }
 
-    // Emit declaration operator (:=, ::, or :) as an operator token
-    if node.kind == .DECLARATION {
-        decl := cast(*Declaration) node;
-        op_col := decl.location.c0 + decl.name.count;
-        op_len: int;
-
-        if !decl.const && decl.type_inst && !decl.expression {
-            op_len = 1;
-        } else {
-            op_col += 1;
-            op_len = 2;
-        }
-
-        emit_op_entry(op_col, op_len, decl.location.l0, entries);
-    }
-
-    if node.kind == .COMPOUND_DECLARATION {
-        cd := cast(*Compound_Declaration) node;
-        if cd.members.count == 0 return;
-
-        // Operator is after the last member name
-        last_member := cd.members[cd.members.count - 1];
-        op_col := last_member.location.c0 + (last_member.location.c1 - last_member.location.c0);
-        op_len: int;
-
-        if !cd.const && cd.type_inst && cd.type_inst.name.count > 0 {
-            op_len = 1; // type-only: "a, b: int"
-        } else {
-            op_col += 1;
-            op_len = 2; // "a, b := expr" or "a, b :: expr"
-        }
-
-        emit_op_entry(op_col, op_len, last_member.location.l0, entries);
-    }
-
-    // Emit string tokens for directive arguments (#import "Basic", #load "file.jai")
-    if node.kind == .DIRECTIVE_IMPORT {
-        di := cast(*Directive_Import) node;
-        if di.module.count > 0 {
-            // String at end of directive node span
-            str_start := node.location.c1 - di.module.count - 2;
-            str_len := di.module.count + 2;
-            emit_string_entry(str_start, str_len, node.location.l0, entries);
-        }
-    }
-    if node.kind == .DIRECTIVE_LOAD {
-        dl := cast(*Directive_Load) node;
-        if dl.file.count > 0 {
-            str_start := node.location.c1 - dl.file.count - 1;
-            str_len := dl.file.count + 2;
-            emit_string_entry(str_start, str_len, node.location.l0, entries);
-        }
-    }
+    // Side-tokens: declaration operators, directive strings
+    emit_declaration_operator(node, entries);
+    emit_directive_string(node, entries);
 }
 
-emit_op_entry :: (col: int, len: int, line: int, entries: *[..]Token_Entry) {
-    entry: Token_Entry;
-    entry.line = xx line;
-    entry.character = xx col;
-    entry.length = xx len;
-    entry.token_type = TOKEN_TYPE_OPERATOR;
-    entry.token_modifiers = 0;
-    array_add(entries, entry);
-}
+Token_Span :: struct { line: int; col: int; length: int; }
 
-emit_string_entry :: (col: int, len: int, line: int, entries: *[..]Token_Entry) {
-    entry: Token_Entry;
-    entry.line = xx line;
-    entry.character = xx col;
-    entry.length = xx len;
-    entry.token_type = TOKEN_TYPE_STRING;
-    entry.token_modifiers = 0;
-    array_add(entries, entry);
-}
-
-emit_comment_token :: (comment: Comment_Token, entries: *[..]Token_Entry) {
-    if comment.l0 != comment.l1 return; // Skip multi-line
-
-    entry: Token_Entry;
-    entry.line = xx comment.l0;
-    entry.character = xx comment.c0;
-    entry.length = xx (comment.c1 - comment.c0);
-    entry.token_type = TOKEN_TYPE_COMMENT;
-    entry.token_modifiers = 0;
-    array_add(entries, entry);
-}
-
-// ── Node classification ───────────────────────────────────────────────────
-
-// Map any AST node to (token_type, modifier_bits, should_emit).
-// Uses parent chain for context (parameter detection, etc.)
-classify_node :: (node: *Node) -> u32, u32, bool {
-    parent := node.parent;
-
-    if node.kind == {
-        // ── Declarations: function / struct / enum / variable ──────
-        case .DECLARATION;
-            decl := cast(*Declaration) node;
-            modifiers: u32 = MODIFIER_DECLARATION;
-            if decl.const { modifiers |= MODIFIER_READONLY; }
-
-            token_type: u32;
-            if decl.expression {
-                if decl.expression.kind == .PROCEDURE {
-                    token_type = TOKEN_TYPE_FUNCTION;
-                } else if decl.expression.kind == .STRUCT {
-                    token_type = TOKEN_TYPE_STRUCT;
-                } else if decl.expression.kind == .UNION {
-                    token_type = TOKEN_TYPE_STRUCT;
-                } else if decl.expression.kind == .ENUM {
-                    token_type = TOKEN_TYPE_ENUM;
-                } else {
-                    token_type = TOKEN_TYPE_VARIABLE;
-                }
-            } else {
-                token_type = TOKEN_TYPE_VARIABLE;
-            }
-
-            // Override: procedure arguments → parameter
-            if parent && parent.kind == .PROCEDURE {
-                proc := cast(*Procedure) parent;
-                for arg: proc.arguments {
-                    if arg == node { token_type = TOKEN_TYPE_PARAMETER; break; }
-                }
-                for ret: proc.returns {
-                    if ret.expression == node { token_type = TOKEN_TYPE_PARAMETER; break; }
-                }
-            }
-
-            // Override: enum members → enumMember
-            if parent && parent.kind == .ENUM {
-                token_type = TOKEN_TYPE_ENUM_MEMBER;
-            }
-
-            // Override: struct/union members → property
-            if parent && (parent.kind == .STRUCT || parent.kind == .UNION) {
-                token_type = TOKEN_TYPE_PROPERTY;
-            }
-
-            return token_type, modifiers, true;
-
-        // ── Identifiers (context-sensitive) ───────────────────────
-        case .IDENTIFIER;
-            modifiers: u32 = 0;
-
-            if parent {
-                // Procedure call target → function
-                if parent.kind == .PROCEDURE_CALL {
-                    pc := cast(*Procedure_Call) parent;
-                    if pc.procedure == node {
-                        return TOKEN_TYPE_FUNCTION, 0, true;
-                    }
-                }
-
-                // Type reference: wrapped in TYPE_INSTANTIATION
-                if parent.kind == .TYPE_INSTANTIATION {
-                    return TOKEN_TYPE_TYPE, 0, true;
-                }
-
-                // Type reference: direct type_inst on a declaration (e.g., `x: int`)
-                if parent.kind == .DECLARATION {
-                    decl := cast(*Declaration) parent;
-                    if decl.type_inst == node {
-                        return TOKEN_TYPE_TYPE, 0, true;
-                    }
-                }
-
-                // Type reference: return type (e.g., `-> bool`)
-                if parent.kind == .RETURN_VALUE {
-                    rv := cast(*Return_Value) parent;
-                    if rv.expression == node {
-                        return TOKEN_TYPE_TYPE, 0, true;
-                    }
-                }
-
-                // Type reference: cast target (e.g., `cast(s64)`)
-                if parent.kind == .CAST {
-                    c := cast(*Cast) parent;
-                    if c.cast_expression == node {
-                        return TOKEN_TYPE_TYPE, 0, true;
-                    }
-                }
-
-                // Type reference: array element type (e.g., `[..]Any`)
-                if parent.kind == .ARRAY_TYPE {
-                    at := cast(*Array_Type) parent;
-                    if at.element_type == node || at.dimension == node {
-                        return TOKEN_TYPE_TYPE, 0, true;
-                    }
-                }
-
-                // Pointer type prefix (e.g., `*NSWindow` in cast context, not `*ptr` deref)
-                if parent.kind == .UNARY_OPERATION {
-                    u := cast(*Unary_Operation) parent;
-                    if u.expression == node {
-                        // Only type if unary op is in type position (type_inst, not expression)
-                        gp := u.parent;
-                        if gp {
-                            if gp.kind == .CAST { return TOKEN_TYPE_TYPE, 0, true; }
-                            if gp.kind == .DECLARATION && cast(*Declaration, gp).type_inst == parent { return TOKEN_TYPE_TYPE, 0, true; }
-                            if gp.kind == .RETURN_VALUE && cast(*Return_Value, gp).expression == parent { return TOKEN_TYPE_TYPE, 0, true; }
-                            if gp.kind == .ARRAY_TYPE { return TOKEN_TYPE_TYPE, 0, true; }
-                        }
-                    }
-                }
-
-                // For-loop iteration variables
-                if parent.kind == .FOR {
-                    f := cast(*For) parent;
-                    if node == f.value || node == f.index || node == f.iterator {
-                        modifiers = MODIFIER_DECLARATION;
-                    }
-                }
-            }
-
-            // Fallback: resolve what this identifier refers to via declaration lookup
-            {
-                ident := cast(*Identifier) node;
-                decls := get_identifier_decls(ident);
-                if decls.count > 0 {
-                    decl := decls[0];
-                    if decl.expression {
-                        if decl.expression.kind == .PROCEDURE {
-                            return TOKEN_TYPE_FUNCTION, 0, true;
-                        }
-                        if decl.expression.kind == .STRUCT || decl.expression.kind == .UNION {
-                            return TOKEN_TYPE_TYPE, 0, true;
-                        }
-                        if decl.expression.kind == .ENUM {
-                            return TOKEN_TYPE_TYPE, 0, true;
-                        }
-                    }
-                    // Enum member reference
-                    if decl.parent && decl.parent.kind == .ENUM {
-                        return TOKEN_TYPE_ENUM_MEMBER, 0, true;
-                    }
-                }
-            }
-
-            return TOKEN_TYPE_VARIABLE, modifiers, true;
-
-        // ── Literals: string / number / bool ───────────────────────
-        case .LITERAL;
-            lit := cast(*Literal) node;
-            if lit.value_type == {
-                case .STRING;
-                    return TOKEN_TYPE_STRING, 0, true;
-                case .INT; #through;
-                case .FLOAT;
-                    return TOKEN_TYPE_NUMBER, 0, true;
-            }
-            return 0, 0, false; // bool, array, struct literals → skip
-
-        // ── Comments (AST comment nodes, not lexer comments) ───────
-        case .COMMENT;
-            return TOKEN_TYPE_COMMENT, 0, true;
-
-        // ── Notes (@deprecated, etc.) ──────────────────────────────
-        case .NOTE;
-            return TOKEN_TYPE_DECORATOR, 0, true;
-
-        // ── Directives → macro ─────────────────────────────────────
-        case .DIRECTIVE_IMPORT; #through;
-        case .DIRECTIVE_LOAD; #through;
-        case .DIRECTIVE_RUN; #through;
-        case .DIRECTIVE_AS; #through;
-        case .DIRECTIVE_PLACE; #through;
-        case .DIRECTIVE_OVERLAY; #through;
-        case .DIRECTIVE_TYPE; #through;
-        case .DIRECTIVE_CODE; #through;
-        case .DIRECTIVE_ADD_CONTEXT; #through;
-        case .DIRECTIVE_ASSERT; #through;
-        case .DIRECTIVE_BYTES; #through;
-        case .DIRECTIVE_LIBRARY; #through;
-        case .DIRECTIVE_NO_RESET; #through;
-        case .DIRECTIVE_INSERT; #through;
-        case .DIRECTIVE_LOCATION; #through;
-        case .DIRECTIVE_MODULE_PARAMETERS; #through;
-        case .DIRECTIVE_PLACEHOLDER; #through;
-        case .DIRECTIVE_PROCEDURE_OF_CALL; #through;
-        case .DIRECTIVE_PROCEDURE_NAME; #through;
-        case .DIRECTIVE_PROGRAM_EXPORT; #through;
-        case .DIRECTIVE_THIS; #through;
-        case .DIRECTIVE_POKE_NAME; #through;
-        case .DIRECTIVE_BAKE_ARGUMENTS; #through;
-        case .DIRECTIVE_BAKE_CONSTANTS; #through;
-        case .DIRECTIVE_DYNAMIC_SPECIALIZE; #through;
-        case .DIRECTIVE_CALLER_CODE; #through;
-        case .DIRECTIVE_CALLER_LOCATION; #through;
-        case .DIRECTIVE_FILE; #through;
-        case .DIRECTIVE_FILEPATH; #through;
-        case .DIRECTIVE_LINE; #through;
-        case .DIRECTIVE_THROUGH; #through;
-        case .DIRECTIVE_SCOPE; #through;
-        case .DIRECTIVE_CHAR; #through;
-        case .DIRECTIVE_COMPILE_TIME; #through;
-        case .DIRECTIVE_DISCARD; #through;
-        case .DIRECTIVE_EXISTS; #through;
-        case .DIRECTIVE_CONTEXT; #through;
-        case .DIRECTIVE_STRING;
-            return TOKEN_TYPE_MACRO, 0, true;
-
-        // ── Keywords ───────────────────────────────────────────────
-        case .RETURN; #through;
-        case .FOR; #through;
-        case .WHILE; #through;
-        case .IF; #through;
-        case .BREAK; #through;
-        case .CONTINUE; #through;
-        case .DEFER; #through;
-        case .REMOVE; #through;
-        case .CAST; #through;
-        case .CASE; #through;
-        case .USING; #through;
-        case .STRUCT; #through;
-        case .ENUM; #through;
-        case .UNION;
-            return TOKEN_TYPE_KEYWORD, 0, true;
-
-        // ── Operators ──────────────────────────────────────────────
-        case .BINARY_OPERATION; #through;
-        case .UNARY_OPERATION;
-            return TOKEN_TYPE_OPERATOR, 0, true;
-
-        // ── Operator overload (keyword 'operator') ─────────────────
-        case .OPERATOR_OVERLOAD;
-            return TOKEN_TYPE_KEYWORD, 0, true;
-
-        // ── Inline assembly ────────────────────────────────────────
-        case .INLINE_ASSEMBLY;
-            return TOKEN_TYPE_KEYWORD, 0, true;
-
-        // ── Quick lambda '->' ──────────────────────────────────────
-        case .QUICK_LAMBDA;
-            return TOKEN_TYPE_OPERATOR, 0, true;
-    }
-
-    return 0, 0, false;
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-compute_token_length :: (node: *Node, token_type: u32) -> int {
-    if node.kind == .DECLARATION {
-        decl := cast(*Declaration) node;
-        return decl.name.count;
-    }
-    if token_type == TOKEN_TYPE_KEYWORD {
-        return keyword_length_for_node(node);
-    }
-    if token_type == TOKEN_TYPE_MACRO {
-        return macro_length_for_node(node);
-    }
-    if token_type == TOKEN_TYPE_OPERATOR {
-        loc := node.location;
-        return loc.c1 - loc.c0; // fallback (binary ops handled in emit_token_for_node)
-    }
+token_span :: (node: *Node, token_type: u32) -> Token_Span {
     loc := node.location;
-    return loc.c1 - loc.c0;
+    col := loc.c0;
+    len := loc.c1 - loc.c0;
+
+    if node.kind == .DECLARATION {
+        decl := cast(*Declaration) node;
+        len = decl.name.count;
+    } else if token_type == TOKEN_TYPE_KEYWORD {
+        len = keyword_length(node);
+    } else if token_type == TOKEN_TYPE_OPERATOR && node.kind == .BINARY_OPERATION {
+        bin := cast(*Binary_Operation) node;
+        if bin.left && bin.right && bin.left.location.c1 > 0 && bin.right.location.c0 > bin.left.location.c1 {
+            col = bin.left.location.c1;
+            len = bin.right.location.c0 - bin.left.location.c1;
+        } else { len = 0; }
+    } else if token_type == TOKEN_TYPE_OPERATOR && node.kind == .UNARY_OPERATION {
+        u := cast(*Unary_Operation) node;
+        if u.expression && u.expression.location.c0 > col {
+            len = u.expression.location.c0 - col;
+        }
+    }
+
+    // Skip multi-line tokens except declarations and keywords
+    if loc.l0 != loc.l1 && node.kind != .DECLARATION && token_type != TOKEN_TYPE_KEYWORD && token_type != TOKEN_TYPE_MACRO {
+        len = 0;
+    }
+
+    return .{loc.l0, col, len};
 }
 
-keyword_length_for_node :: (node: *Node) -> int {
+keyword_length :: (node: *Node) -> int {
     if node.kind == {
         case .RETURN; return 6;
         case .FOR; return 3;
@@ -566,57 +231,247 @@ keyword_length_for_node :: (node: *Node) -> int {
         case .OPERATOR_OVERLOAD; return 8;
         case .INLINE_ASSEMBLY; return 6;
     }
-    loc := node.location;
-    return loc.c1 - loc.c0;
+    return node.location.c1 - node.location.c0;
 }
 
-macro_length_for_node :: (node: *Node) -> int {
-    loc := node.location;
-    return loc.c1 - loc.c0;
+// ── Side tokens ───────────────────────────────────────────────────────────
+
+emit_declaration_operator :: (node: *Node, entries: *[..]Token_Entry) {
+    if node.kind == .DECLARATION {
+        decl := cast(*Declaration) node;
+        op_col := decl.location.c0 + decl.name.count;
+        op_len := 2;
+        if !decl.const && decl.type_inst && !decl.expression { op_len = 1; op_col = decl.location.c0 + decl.name.count; }
+        else { op_col += 1; }
+        add_token_entry(xx decl.location.l0, xx op_col, xx op_len, TOKEN_TYPE_OPERATOR, 0, entries);
+    }
+    if node.kind == .COMPOUND_DECLARATION {
+        cd := cast(*Compound_Declaration) node;
+        if cd.members.count == 0 return;
+        last := cd.members[cd.members.count - 1];
+        op_col := last.location.c0 + (last.location.c1 - last.location.c0);
+        op_len := 2;
+        if !cd.const && cd.type_inst && cd.type_inst.name.count > 0 { op_len = 1; }
+        else { op_col += 1; }
+        add_token_entry(xx last.location.l0, xx op_col, xx op_len, TOKEN_TYPE_OPERATOR, 0, entries);
+    }
 }
 
-// ── Sorting & dedup ────────────────────────────────────────────────────────
+emit_directive_string :: (node: *Node, entries: *[..]Token_Entry) {
+    if node.kind == .DIRECTIVE_IMPORT {
+        di := cast(*Directive_Import) node;
+        if di.module.count > 0 {
+            start := node.location.c1 - di.module.count - 2; // quotes
+            add_token_entry(xx node.location.l0, xx start, xx (di.module.count + 2), TOKEN_TYPE_STRING, 0, entries);
+        }
+    }
+    if node.kind == .DIRECTIVE_LOAD {
+        dl := cast(*Directive_Load) node;
+        if dl.file.count > 0 {
+            start := node.location.c1 - dl.file.count - 2;
+            add_token_entry(xx node.location.l0, xx start, xx (dl.file.count + 2), TOKEN_TYPE_STRING, 0, entries);
+        }
+    }
+}
+
+add_token_entry :: (line: int, col: int, len: int, tt: u32, mod: u32, entries: *[..]Token_Entry) {
+    if len <= 0 return;
+    entry: Token_Entry;
+    entry.line = xx line;
+    entry.character = xx col;
+    entry.length = xx len;
+    entry.token_type = tt;
+    entry.token_modifiers = mod;
+    array_add(entries, entry);
+}
+
+// ── Declaration helpers ────────────────────────────────────────────────────
+
+declaration_type :: (decl: *Declaration) -> u32 {
+    if !decl.expression return TOKEN_TYPE_VARIABLE;
+    if decl.expression.kind == .PROCEDURE return TOKEN_TYPE_FUNCTION;
+    if decl.expression.kind == .STRUCT   return TOKEN_TYPE_STRUCT;
+    if decl.expression.kind == .UNION    return TOKEN_TYPE_STRUCT;
+    if decl.expression.kind == .ENUM     return TOKEN_TYPE_ENUM;
+    return TOKEN_TYPE_VARIABLE;
+}
+
+classify_declaration :: (node: *Node, parent: *Node) -> u32, u32, bool {
+    decl := cast(*Declaration) node;
+    mod: u32 = MODIFIER_DECLARATION;
+    if decl.const { mod |= MODIFIER_READONLY; }
+    tt := declaration_type(decl);
+    if parent {
+        if parent.kind == .PROCEDURE {
+            proc := cast(*Procedure) parent;
+            for arg: proc.arguments { if arg == node { tt = TOKEN_TYPE_PARAMETER; break; } }
+            for ret: proc.returns { if ret.expression == node { tt = TOKEN_TYPE_PARAMETER; break; } }
+        }
+        if parent.kind == .ENUM { tt = TOKEN_TYPE_ENUM_MEMBER; }
+        if parent.kind == .STRUCT || parent.kind == .UNION { tt = TOKEN_TYPE_PROPERTY; }
+    }
+    return tt, mod, true;
+}
+
+// ── Identifier helpers ─────────────────────────────────────────────────────
+
+is_procedure_call_target :: (node: *Node, parent: *Node) -> bool {
+    if parent.kind != .PROCEDURE_CALL return false;
+    pc := cast(*Procedure_Call) parent;
+    return pc.procedure == node;
+}
+
+is_in_type_position :: (node: *Node, parent: *Node) -> bool {
+    if !parent return false;
+    if parent.kind == .TYPE_INSTANTIATION return true;
+    if parent.kind == .DECLARATION && cast(*Declaration, parent).type_inst == node return true;
+    if parent.kind == .RETURN_VALUE && cast(*Return_Value, parent).expression == node return true;
+    if parent.kind == .CAST && cast(*Cast, parent).cast_expression == node return true;
+    if parent.kind == .ARRAY_TYPE {
+        at := cast(*Array_Type) parent;
+        if at.element_type == node || at.dimension == node return true;
+    }
+    if parent.kind == .UNARY_OPERATION {
+        u := cast(*Unary_Operation) parent;
+        if u.expression == node {
+            gp := u.parent;
+            if !gp return false;
+            if gp.kind == .CAST return true;
+            if gp.kind == .DECLARATION && cast(*Declaration, gp).type_inst == parent return true;
+            if gp.kind == .RETURN_VALUE && cast(*Return_Value, gp).expression == parent return true;
+            if gp.kind == .ARRAY_TYPE return true;
+        }
+    }
+    return false;
+}
+
+classify_identifier :: (node: *Node, parent: *Node) -> u32, u32, bool {
+    mod: u32 = 0;
+    if parent {
+        if is_procedure_call_target(node, parent) return TOKEN_TYPE_FUNCTION, 0, true;
+        if is_in_type_position(node, parent) return TOKEN_TYPE_TYPE, 0, true;
+        if parent.kind == .FOR {
+            f := cast(*For) parent;
+            if node == f.value || node == f.index || node == f.iterator { mod = MODIFIER_DECLARATION; }
+        }
+    }
+    ident := cast(*Identifier) node;
+    decls := get_identifier_decls(ident);
+    if decls.count > 0 {
+        decl := decls[0];
+        if decl.expression {
+            if decl.expression.kind == .PROCEDURE return TOKEN_TYPE_FUNCTION, 0, true;
+            if decl.expression.kind == .STRUCT || decl.expression.kind == .UNION return TOKEN_TYPE_TYPE, 0, true;
+            if decl.expression.kind == .ENUM return TOKEN_TYPE_TYPE, 0, true;
+        }
+        if decl.parent && decl.parent.kind == .ENUM return TOKEN_TYPE_ENUM_MEMBER, 0, true;
+    }
+    return TOKEN_TYPE_VARIABLE, mod, true;
+}
+
+// ── Node classification ───────────────────────────────────────────────────
+
+classify_node :: (node: *Node) -> u32, u32, bool {
+    parent := node.parent;
+
+    if node.kind == {
+        case .DECLARATION;
+            {
+                decl := cast(*Declaration) node;
+                mod: u32 = MODIFIER_DECLARATION;
+                if decl.const { mod |= MODIFIER_READONLY; }
+                tt := declaration_type(decl);
+                if parent {
+                    if parent.kind == .PROCEDURE {
+                        proc := cast(*Procedure) parent;
+                        for arg: proc.arguments { if arg == node { tt = TOKEN_TYPE_PARAMETER; break; } }
+                        for ret: proc.returns { if ret.expression == node { tt = TOKEN_TYPE_PARAMETER; break; } }
+                    }
+                    if parent.kind == .ENUM { tt = TOKEN_TYPE_ENUM_MEMBER; }
+                    if parent.kind == .STRUCT || parent.kind == .UNION { tt = TOKEN_TYPE_PROPERTY; }
+                }
+                return tt, mod, true;
+            }
+
+        case .IDENTIFIER;
+            {
+                mod: u32 = 0;
+                if parent {
+                    if is_procedure_call_target(node, parent) return TOKEN_TYPE_FUNCTION, 0, true;
+                    if is_in_type_position(node, parent) return TOKEN_TYPE_TYPE, 0, true;
+                    if parent.kind == .FOR {
+                        f := cast(*For) parent;
+                        if node == f.value || node == f.index || node == f.iterator { mod = MODIFIER_DECLARATION; }
+                    }
+                }
+                ident := cast(*Identifier) node;
+                decls := get_identifier_decls(ident);
+                if decls.count > 0 {
+                    decl := decls[0];
+                    if decl.expression {
+                        if decl.expression.kind == .PROCEDURE return TOKEN_TYPE_FUNCTION, 0, true;
+                        if decl.expression.kind == .STRUCT || decl.expression.kind == .UNION return TOKEN_TYPE_TYPE, 0, true;
+                        if decl.expression.kind == .ENUM return TOKEN_TYPE_TYPE, 0, true;
+                    }
+                    if decl.parent && decl.parent.kind == .ENUM return TOKEN_TYPE_ENUM_MEMBER, 0, true;
+                }
+                return TOKEN_TYPE_VARIABLE, mod, true;
+            }
+
+        case .LITERAL;
+            lit := cast(*Literal) node;
+            if lit.value_type == { case .STRING; return TOKEN_TYPE_STRING, 0, true; }
+            if lit.value_type == { case .INT; #through; case .FLOAT; return TOKEN_TYPE_NUMBER, 0, true; }
+            return 0, 0, false;
+
+        case .COMMENT;    return TOKEN_TYPE_COMMENT,   0, true;
+        case .NOTE;       return TOKEN_TYPE_DECORATOR, 0, true;
+
+        // Directives → macro
+        case .DIRECTIVE_IMPORT; #through; case .DIRECTIVE_LOAD; #through; case .DIRECTIVE_RUN; #through;
+        case .DIRECTIVE_AS; #through; case .DIRECTIVE_PLACE; #through; case .DIRECTIVE_OVERLAY; #through;
+        case .DIRECTIVE_TYPE; #through; case .DIRECTIVE_CODE; #through; case .DIRECTIVE_ADD_CONTEXT; #through;
+        case .DIRECTIVE_ASSERT; #through; case .DIRECTIVE_BYTES; #through; case .DIRECTIVE_LIBRARY; #through;
+        case .DIRECTIVE_NO_RESET; #through; case .DIRECTIVE_INSERT; #through; case .DIRECTIVE_LOCATION; #through;
+        case .DIRECTIVE_MODULE_PARAMETERS; #through; case .DIRECTIVE_PLACEHOLDER; #through;
+        case .DIRECTIVE_PROCEDURE_OF_CALL; #through; case .DIRECTIVE_PROCEDURE_NAME; #through;
+        case .DIRECTIVE_PROGRAM_EXPORT; #through; case .DIRECTIVE_THIS; #through; case .DIRECTIVE_POKE_NAME; #through;
+        case .DIRECTIVE_BAKE_ARGUMENTS; #through; case .DIRECTIVE_BAKE_CONSTANTS; #through;
+        case .DIRECTIVE_DYNAMIC_SPECIALIZE; #through; case .DIRECTIVE_CALLER_CODE; #through;
+        case .DIRECTIVE_CALLER_LOCATION; #through; case .DIRECTIVE_FILE; #through; case .DIRECTIVE_FILEPATH; #through;
+        case .DIRECTIVE_LINE; #through; case .DIRECTIVE_THROUGH; #through; case .DIRECTIVE_SCOPE; #through;
+        case .DIRECTIVE_CHAR; #through; case .DIRECTIVE_COMPILE_TIME; #through; case .DIRECTIVE_DISCARD; #through;
+        case .DIRECTIVE_EXISTS; #through; case .DIRECTIVE_CONTEXT; #through; case .DIRECTIVE_STRING;
+            return TOKEN_TYPE_MACRO, 0, true;
+
+        // Keywords
+        case .RETURN; #through; case .FOR; #through; case .WHILE; #through; case .IF; #through;
+        case .BREAK; #through; case .CONTINUE; #through; case .DEFER; #through; case .REMOVE; #through;
+        case .CAST; #through; case .CASE; #through; case .USING; #through; case .STRUCT; #through;
+        case .ENUM; #through; case .UNION; #through; case .OPERATOR_OVERLOAD; #through; case .INLINE_ASSEMBLY;
+            return TOKEN_TYPE_KEYWORD, 0, true;
+
+        // Operators
+        case .BINARY_OPERATION; #through; case .UNARY_OPERATION;
+            return TOKEN_TYPE_OPERATOR, 0, true;
+
+        case .QUICK_LAMBDA;
+            return TOKEN_TYPE_OPERATOR, 0, true;
+    }
+
+    return 0, 0, false;
+}
+
+// ── Sorting ───────────────────────────────────────────────────────────────
 
 sort_token_entries :: (entries: []Token_Entry) {
     for i: 1 .. entries.count - 1 {
         key := entries[i];
         j := i - 1;
-        while j >= 0 && token_entry_less(key, entries[j]) {
+        while j >= 0 && (entries[j].line > key.line || (entries[j].line == key.line && entries[j].character > key.character)) {
             entries[j + 1] = entries[j];
             j -= 1;
         }
         entries[j + 1] = key;
-    }
-}
-
-token_entry_less :: (a: Token_Entry, b: Token_Entry) -> bool {
-    if a.line < b.line return true;
-    if a.line > b.line return false;
-    return a.character < b.character;
-}
-
-// ── Delta encoding ─────────────────────────────────────────────────────────
-
-delta_encode_tokens :: (entries: []Token_Entry, out: *[..]int) {
-    prev_line: int = 0;
-    prev_char: int = 0;
-
-    for entry: entries {
-        delta_line := xx entry.line - prev_line;
-        if delta_line == 0 {
-            delta_char := xx entry.character - prev_char;
-            array_add(out, 0);
-            array_add(out, delta_char);
-        } else {
-            array_add(out, delta_line);
-            array_add(out, xx entry.character);
-        }
-
-        array_add(out, xx entry.length);
-        array_add(out, xx entry.token_type);
-        array_add(out, xx entry.token_modifiers);
-
-        prev_line = xx entry.line;
-        prev_char = xx entry.character;
     }
 }
