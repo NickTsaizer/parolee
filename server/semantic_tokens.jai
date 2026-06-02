@@ -155,8 +155,7 @@ emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
         length := compute_token_length(node, token_type);
         start_col := loc.c0;
 
-        // For binary operators, position is between left and right operands.
-        // Skip entirely if we can't determine position (e.g., compound left-hand sides).
+        // For binary/unary operators, position is between operands or at operator char
         if token_type == TOKEN_TYPE_OPERATOR && node.kind == .BINARY_OPERATION {
             bin := cast(*Binary_Operation) node;
             if bin.left && bin.right && bin.left.location.c1 > 0 && bin.right.location.c0 > bin.left.location.c1 {
@@ -164,6 +163,12 @@ emit_token_for_node :: (node: *Node, entries: *[..]Token_Entry) {
                 length = bin.right.location.c0 - bin.left.location.c1;
             } else {
                 length = 0;
+            }
+        }
+        if token_type == TOKEN_TYPE_OPERATOR && node.kind == .UNARY_OPERATION {
+            u := cast(*Unary_Operation) node;
+            if u.expression && u.expression.location.c0 > loc.c0 {
+                length = u.expression.location.c0 - loc.c0;
             }
         }
 
@@ -376,10 +381,13 @@ classify_node :: (node: *Node) -> u32, u32, bool {
                 if parent.kind == .UNARY_OPERATION {
                     u := cast(*Unary_Operation) parent;
                     if u.expression == node {
-                        // Only type if in type context (cast, decl type_inst, return type, array element)
+                        // Only type if unary op is in type position (type_inst, not expression)
                         gp := u.parent;
-                        if gp && (gp.kind == .CAST || gp.kind == .DECLARATION || gp.kind == .RETURN_VALUE || gp.kind == .ARRAY_TYPE) {
-                            return TOKEN_TYPE_TYPE, 0, true;
+                        if gp {
+                            if gp.kind == .CAST { return TOKEN_TYPE_TYPE, 0, true; }
+                            if gp.kind == .DECLARATION && cast(*Declaration, gp).type_inst == parent { return TOKEN_TYPE_TYPE, 0, true; }
+                            if gp.kind == .RETURN_VALUE && cast(*Return_Value, gp).expression == parent { return TOKEN_TYPE_TYPE, 0, true; }
+                            if gp.kind == .ARRAY_TYPE { return TOKEN_TYPE_TYPE, 0, true; }
                         }
                     }
                 }
