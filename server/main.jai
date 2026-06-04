@@ -506,7 +506,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 // Returns when no more data is available (poll returns false).
 
 drain_pending_messages :: () {
-    while stdin_wait(0) {
+    while stdin_wait(1) {  // 1ms — brief wait allows pipe buffer to catch up with burst messages
         body, success := read_message_from_stdin(,, temp);
         if !success {
             log("Failed to read message. Skipping.");
