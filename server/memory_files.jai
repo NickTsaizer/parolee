@@ -1,3 +1,8 @@
+Mem_File :: struct {
+    content: [..]u8;
+    line_offsets: [..]int; // byte offset of start of each line
+}
+
 init_memory_files :: () {
     init(*server.memory_files_lock);
 }
@@ -7,23 +12,41 @@ deinit_memory_files :: () {
     deinit(*server.memory_files);
 }
 
-create_memory_file :: (file_path: string, content: string) {
-    content_dynamic: [..]u8;
+compute_line_offsets :: (mf: *Mem_File) {
+    array_reset(*mf.line_offsets);
+    if mf.content.count == 0 return;
+    array_add(*mf.line_offsets, 0); // line 0 always starts at index 0
+    for i: 0 .. mf.content.count - 1 {  // Jai .. is inclusive
+        if i + 1 < mf.content.count && mf.content[i] == #char "\n" {
+            array_add(*mf.line_offsets, i + 1);
+        }
+    }
+}
 
-    array_copy(*content_dynamic, cast([]u8) content);
-    // free(content);
+create_memory_file :: (file_path: string, content: string) {
+    mf: Mem_File;
+    array_copy(*mf.content, cast([]u8) content);
+    compute_line_offsets(*mf);
 
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
-    table_set(*server.memory_files, copy_string(file_path), content_dynamic);
+
+    // Free old file data if this file was already cached
+    existing_ok, old_mf := table_find(*server.memory_files, file_path);
+    if existing_ok {
+        array_free(old_mf.content);
+        array_free(old_mf.line_offsets);
+    }
+
+    table_set(*server.memory_files, copy_string(file_path), mf);
 }
 
 edit_memory_file :: (file_path: string, changes: []LSP_Content_Change) {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
 
-    content := table_find_pointer(*server.memory_files, file_path);
-    if !content {
+    mf := table_find_pointer(*server.memory_files, file_path);
+    if !mf {
         log_error("File is not in the cache %", file_path);
         return;
     }
@@ -31,17 +54,21 @@ edit_memory_file :: (file_path: string, changes: []LSP_Content_Change) {
     for change: changes {
         from := change.range.start;
         to := change.range.end;
-        apply_change(content, from, to, change.text);
+        apply_change(*mf.content, from, to, change.text);
     }
+
+    // Recompute line offsets after content mutation
+    compute_line_offsets(mf);
 }
 
 remove_memory_file :: (file_path: string) {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
 
-    ok, content := table_find(*server.memory_files, file_path);
+    ok, mf := table_find(*server.memory_files, file_path);
     if !ok return;
-    array_free(content);
+    array_free(mf.content);
+    array_free(mf.line_offsets);
 
     found := table_remove(*server.memory_files, file_path);
     if !found {
@@ -53,115 +80,70 @@ find_range_in_memory_file :: (file: string, range: LSP_Range) -> string {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
 
-    ok, content := table_find(*server.memory_files, file);
-    if !ok {
-        return "";
-    }
+    ok, mf := table_find(*server.memory_files, file);
+    if !ok return "";
 
-    current_line: int;
-    start_index: int = -1;
-    end_index: int = -1;
+    offsets := mf.line_offsets;
+    start_line := xx range.start.line;
+    end_line := xx range.end.line;
 
-    // We get index of starting and ending byte of the range.
-    for char: content {
-        if current_line == range.start.line && start_index == -1 {
-            start_index = it_index + range.start.character;
-        }
+    if start_line >= offsets.count || end_line >= offsets.count return "";
 
-        if current_line == range.end.line && end_index == -1 {
-            end_index = it_index + range.end.character;
-        }
+    start_index := offsets[start_line] + xx range.start.character;
+    end_index := offsets[end_line] + xx range.end.character;
 
-        if char == #char "\n" {
-            current_line += 1;
-        }
-
-        if start_index > -1 && end_index > -1 {
-            break;
-        }
-    }
-
-    return to_string(*content[start_index], end_index-start_index);
+    if start_index >= mf.content.count || end_index > mf.content.count return "";
+    return to_string(*mf.content[start_index], end_index - start_index);
 }
 
 find_line_in_memory_file :: (file: string, position: LSP_Position) -> string {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
-    ok, content := table_find(*server.memory_files, file);
-    if !ok {
-        return "";
+    ok, mf := table_find(*server.memory_files, file);
+    if !ok return "";
+
+    line := xx position.line;
+    offsets := mf.line_offsets;
+    if line >= offsets.count return "";
+
+    start_index := offsets[line];
+    if start_index >= mf.content.count return "";
+
+    // Find end of line (next newline or end of content)
+    end_index := mf.content.count;
+    i := start_index;
+    while i < mf.content.count {
+        if mf.content[i] == #char "\n" { end_index = i; break; }
+        i += 1;
     }
 
-    final_line: int;
-    start_index: int = -1;
-    end_index := content.count;
-
-    // @SPEED: This searching could be probably done faster if we had server.memory_files stored as array of lines instead of file content.
-    for char: content {
-        if char == #char "\n" {
-            final_line += 1;
-        }
-
-        if final_line == position.line {
-            start_index = it_index;
-
-            if final_line != 0 {
-                start_index += 1;
-            }
-
-            break;
-        }
-    }
-
-    for index: start_index..content.count-1 {
-        char := content[index];
-        if char == #char "\n" {
-            end_index = index;
-            break;
-        }
-    }
-
-    return to_string(*content[start_index], end_index-start_index);
+    return to_string(*mf.content[start_index], end_index - start_index);
 }
 
 get_memory_file :: (name: string) -> []u8 {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
 
-    ok, content := table_find(*server.memory_files, name);
-    if !ok {
-        return .[];
-    }
+    ok, mf := table_find(*server.memory_files, name);
+    if !ok return .[];
 
-    return content;
+    return mf.content;
 }
 
 find_word_in_memory_file :: (file: string, position: LSP_Position, with_start_separator := false, with_end_separator := false) -> string {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
-    ok, content := table_find(*server.memory_files, file);
-    if !ok {
-        return "";
-    }
+    ok, mf := table_find(*server.memory_files, file);
+    if !ok return "";
 
-    final_line: int;
-    pointer_index: int = -1;
+    line := xx position.line;
+    offsets := mf.line_offsets;
+    if line >= offsets.count return "";
 
-    // @SPEED: This searching could be probably done faster if we had server.memory_files stored as array of lines instead of file content.
-    for char: content {
-        if char == #char "\n" {
-            final_line += 1;
-        }
+    pointer_index := offsets[line] + xx position.character;
+    if pointer_index >= mf.content.count return "";
 
-        if final_line == position.line {
-            pointer_index = it_index + position.character;
-            break;
-        }
-    }
-
-    if pointer_index == -1 {
-        return "";
-    }
+    content := mf.content;
 
     // Word search
     start_index := 0;
@@ -172,32 +154,25 @@ find_word_in_memory_file :: (file: string, position: LSP_Position, with_start_se
     }
 
     // Start search
-    for < index: 0..pointer_index {
+    for < index: 0 .. pointer_index {
         char := content[index];
         if is_seperation(char) {
             start_index = index;
-            if !with_start_separator {
-                start_index += 1;
-            }
-
-            break;
+            if !with_start_separator { start_index += 1; }
         }
     }
 
     // End search
-    for index: pointer_index..content.count-1 {
+    for index: pointer_index .. content.count - 1 {
         char := content[index];
         if is_seperation(char) {
             end_index = index;
-            if !with_end_separator {
-                end_index += 1;
-            }
-
+            if !with_end_separator { end_index += 1; }
             break;
         }
     }
 
-    return to_string(*content[start_index], end_index-start_index);
+    return to_string(*content[start_index], end_index - start_index);
 }
 
 #scope_file

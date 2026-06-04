@@ -73,6 +73,15 @@ get_file :: (path: string) -> *Program_File {
     return file;
 }
 
+path_is_allowed :: (path: string) -> bool {
+    if path.count == 0 return true; // empty path handled by caller
+    // Allow paths within project root or Jai runtime directory
+    if begins_with(path, server.project_root) return true;
+    if server.args.jai_path.count > 0 && begins_with(path, server.args.jai_path) return true;
+    log_error("Path traversal blocked: '%' (root='%', jai='%')", path, server.project_root, server.args.jai_path);
+    return false;
+}
+
 search_for_file :: (name: string) -> *Program_File {
     final_file: *Program_File;
 
@@ -126,10 +135,24 @@ parse_file :: (input_path: string, force := false) {
 
     path := normalize_path(input_path);
 
+    // Thread-safe find-or-create: protect server.files lookup + add with mutex
+    lock(*server.files_mutex);
     ok, file := table_find(*server.files, path);
     if !force && ok {
+        unlock(*server.files_mutex);
         // log("Skipping % because it already exists", path);
         return;
+    }
+    if ok {
+        reset_file(file); // clear old data
+        unlock(*server.files_mutex);
+    } else {
+        file = New(Program_File);
+        file.path = copy_string(path);
+        set_allocators(*file.ast_pool, context.default_allocator);
+        set_allocators(*file.analysis_pool, context.default_allocator);
+        table_add(*server.files, file.path, file);
+        unlock(*server.files_mutex);
     }
 
     // log("Parse file: %", path);
@@ -138,6 +161,12 @@ parse_file :: (input_path: string, force := false) {
     content_from_file: bool;
 
     if content.count == 0 {
+        // Validate path is within allowed roots before reading from disk
+        if !path_is_allowed(path) {
+            log_error("Refusing to read file outside project/Jai roots: %", path);
+            return;
+        }
+
         exists: bool;
 
         content, exists = read_entire_file(path, log_errors=false);
@@ -147,16 +176,6 @@ parse_file :: (input_path: string, force := false) {
         }
 
         content_from_file = true;
-    }
-
-    if ok {
-        reset_file(file); // clear old data
-    } else {
-        file = New(Program_File);
-        file.path = copy_string(path);
-        set_allocators(*file.ast_pool, context.default_allocator);
-        set_allocators(*file.analysis_pool, context.default_allocator);
-        table_add(*server.files, file.path, file);
     }
 
     path_without_filename := trim_right(path_strip_filename(file.path), "/");
@@ -184,23 +203,21 @@ parse_file :: (input_path: string, force := false) {
     if content_from_file free(content);
     // log("Parsed: % (nodes: %, declarations: %, pointer: %)", path, file.nodes.count, file.declarations.count, file);
 
+    lock(*server.files_mutex);
     array_add_if_unique(*server.files_to_be_analyzed, file);
 
     // We must revalidate all files that are using this file in some way.
-    files_using_this_file := get_files_that_use(file,, temp);
-    for file_using_this_file: files_using_this_file {
-        // if array_find(server.files_to_be_analyzed, file_using_this_file) {
-        //     continue;
-        // }
-
-        array_add_if_unique(*server.files_to_be_analyzed, file_using_this_file);
+    if !server.skip_reanalyze {
+        files_using_this_file := get_files_that_use(file,, temp);
+        for file_using_this_file: files_using_this_file {
+            array_add_if_unique(*server.files_to_be_analyzed, file_using_this_file);
+        }
     }
+    unlock(*server.files_mutex);
 }
 
 analyze_files :: () {
     for file: server.files_to_be_analyzed {
-        // table_reset(*file.resolved_identifiers);
-        // array_reset(*file.unresolved_identifiers);
         release(*file.analysis_pool);
     }
 
@@ -306,7 +323,7 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
                 context.allocator = saved;
             }
         } else {
-            parse_file(path); // @TODO: Run this in another thread?
+            if path.count > 0 parse_file(path); // @TODO: Run this in another thread?
         }
     }
 
@@ -340,7 +357,7 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
             array_add_if_unique(*server.deferred_imports, copy_string(load_relative_path));
             context.allocator = saved;
         } else {
-            parse_file(load_relative_path); // @TODO: Run this in another thread?
+            if load_relative_path.count > 0 parse_file(load_relative_path); // @TODO: Run this in another thread?
         }
     }
 
@@ -428,16 +445,52 @@ get_module_import_path :: (_import: *Directive_Import, current_path: string) -> 
 // }
 
 get_node_by_location :: (file: *Program_File, location: Node.Location, filter: Node.Kind = .UNINITIALIZATED) -> *Node {
+    nodes := file.nodes;
+    if nodes.count == 0 return null;
+
+    // Binary search: find first node at or after target line
+    // Jai .. is inclusive, so valid indices are [0, nodes.count-1]
+    left := 0;
+    right := nodes.count - 1;
+    while left < right {
+        mid := (left + right) / 2;
+        if nodes[mid].location.l0 < location.l0 {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+
     nearest_node: *Node;
 
-    for node: file.nodes {
-        if filter != .UNINITIALIZATED && node.kind != filter continue;
-        if !contains(node.location, location) continue;
+    // Scan backwards from binary search landing point — check all nodes.
+    // Parent nodes can start far before target line, so no early break.
+    i := left;
+    while i >= 0 {
+        node := nodes[i];
+        if filter == .UNINITIALIZATED || node.kind == filter {
+            if contains(node.location, location) {
+                if !nearest_node || contains(nearest_node.location, node.location) {
+                    nearest_node = node;
+                }
+            }
+        }
+        i -= 1;
+    }
 
-        // If we are not smaller than so far nearest node we skip.
-        if nearest_node && !contains(nearest_node.location, node.location) continue;
-
-        nearest_node = node;
+    // Scan forwards — safe to break when node starts after target line
+    i = left + 1;
+    while i < nodes.count {
+        node := nodes[i];
+        if node.location.l0 > location.l0 break; // starts after target — stop
+        if filter == .UNINITIALIZATED || node.kind == filter {
+            if contains(node.location, location) {
+                if !nearest_node || contains(nearest_node.location, node.location) {
+                    nearest_node = node;
+                }
+            }
+        }
+        i += 1;
     }
 
     return nearest_node;
@@ -457,26 +510,21 @@ get_file_links :: (file: *Program_File) -> [..]Linked_File {
             is_avaiable_from_one_of_the_parents: bool;
 
             for file_that_load_this_file: files_that_load_this_file {
-                already_checked: [..]string;
-                defer array_free(already_checked);
 
                 if file_that_load_this_file.path == it.path {
                     is_avaiable_from_one_of_the_parents = true;
                     break;
                 }
 
-                avaiable, from_import= := is_avaiable_from(file_that_load_this_file, it.path, *already_checked);
+                avaiable, from_import= := is_avaiable_from(file_that_load_this_file, it.path);
                 if !avaiable continue;
 
                 is_avaiable_from_one_of_the_parents = true;
                 break;
             }
 
-            already_checked: [..]string;
-            defer array_free(already_checked);
-
             if !is_avaiable_from_one_of_the_parents {
-                avaiable, from_import= := is_avaiable_from(file, it.path, *already_checked);
+                avaiable, from_import= := is_avaiable_from(file, it.path);
                 if !avaiable continue;
             }
         }
@@ -630,11 +678,17 @@ get_declarations_from_for :: (decls: *[..]*Declaration, node: *Node, from_loc: *
 
 skip_node: *Node;
 
-get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc: *Node.Location, name := "", only_consts := false) {
+MAX_RECURSION_DEPTH :: 512; // guard against stack overflow in deeply nested ASTs
+
+get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc: *Node.Location, name := "", only_consts := false, depth: int = 0) {
     if !node return;
+    if depth >= MAX_RECURSION_DEPTH {
+        log_error("get_declarations_from_parent: max recursion depth (%%) reached", MAX_RECURSION_DEPTH);
+        return;
+    }
 
     if skip_node != null && node == skip_node || only_consts && node.kind != .BLOCK {
-        get_declarations_from_parent(decls, node.parent, from_loc, name, only_consts);
+        get_declarations_from_parent(decls, node.parent, from_loc, name, only_consts, depth + 1);
         return;
     }
 
@@ -744,7 +798,7 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
         case .FOR; get_declarations_from_for(decls, node, from_loc, name);
     }
 
-    get_declarations_from_parent(decls, node.parent, from_loc, name, only_consts);
+    get_declarations_from_parent(decls, node.parent, from_loc, name, only_consts, depth + 1);
 }
 
 get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *Node.Location = null, name := "", only_loaded := false) -> []*Declaration {
@@ -886,9 +940,7 @@ get_files_that_use :: (target_file: *Program_File) -> []*Program_File {
     files: [..]*Program_File;
 
     for file: server.files {
-        already_checked: [..]string;
-        defer array_free(already_checked);
-        if !is_avaiable_from(file, target_file.path, *already_checked) continue;
+        if !is_avaiable_from(file, target_file.path) continue;
         array_add(*files, file);
     }
 
@@ -899,16 +951,21 @@ get_files_that_load :: (target_file: *Program_File) -> []*Program_File {
     files: [..]*Program_File;
 
     for file: server.files {
-        already_checked: [..]string;
-        defer array_free(already_checked);
-        if !is_avaiable_from(file, target_file.path, *already_checked, true) continue;
+        if !is_avaiable_from(file, target_file.path, true) continue;
         array_add(*files, file);
     }
 
     return files;
 }
 
-is_avaiable_from :: (file: *Program_File, path: string, already_checked: *[..]string, $loads_only := false) -> bool, bool {
+is_avaiable_from :: (file: *Program_File, path: string, $loads_only := false) -> bool, bool {
+    already_checked: [..]string;
+    loaded, from_import := is_avaiable_from_impl(file, path, *already_checked, loads_only);
+    array_free(already_checked);
+    return loaded, from_import;
+}
+
+is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[..]string, $loads_only := false) -> bool, bool {
     from_import: bool;
     loaded: bool;
 
@@ -928,9 +985,9 @@ is_avaiable_from :: (file: *Program_File, path: string, already_checked: *[..]st
 
             found: bool;
             if it.is_using {
-                found = is_avaiable_from(next_file, path, already_checked, false);
+                found = is_avaiable_from_impl(next_file, path, already_checked, false);
             } else {
-                found = is_avaiable_from(next_file, path, already_checked, true);
+                found = is_avaiable_from_impl(next_file, path, already_checked, true);
             }
 
             if found {
@@ -944,8 +1001,6 @@ is_avaiable_from :: (file: *Program_File, path: string, already_checked: *[..]st
     for file.loads {
         load_path := trim_right(path_strip_filename(file.path), "/");
         load_relative_path := normalize_path(join(load_path, "/", it.file));
-        // @TODO: free load_relative_path
-        // defer free(load_relative_path);
 
         if array_find(already_checked.*, load_relative_path) continue;
         array_add(already_checked, load_relative_path);
@@ -956,7 +1011,7 @@ is_avaiable_from :: (file: *Program_File, path: string, already_checked: *[..]st
         }
 
         next_file := get_file(load_relative_path);
-        if next_file && is_avaiable_from(next_file, path, already_checked, loads_only) {
+        if next_file && is_avaiable_from_impl(next_file, path, already_checked, loads_only) {
             loaded = true;
             break;
         }
@@ -1158,21 +1213,20 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
         if current_node.kind == .BINARY_OPERATION {
             bin_op := cast(*Binary_Operation)current_node;
 
-            if bin_op.operation == {
-                case .IS_NOT_EQUAL;
-                    #through;
-                case .IS_EQUAL;
-                    #through;
-                case .ASSIGN;
-                    if bin_op.left.kind == .BINARY_OPERATION {
-                        path := get_dot_path(xx bin_op.left, null);
-                        current_node = get_path_type(path);
-                    } else {
-                        current_node = get_path_type(.[bin_op.left]);
-                    }
-                case;
-                    path := get_dot_path(bin_op, null);
+            // DOT chains: walk the chain path (a.b.c → resolve fields in order)
+            // Everything else (=, +=, ==, <, +, etc.): resolve left side's type
+            if bin_op.operation == .DOT {
+                path := get_dot_path(bin_op, null);
+                current_node = get_path_type(path);
+            } else if bin_op.left {
+                if bin_op.left.kind == .BINARY_OPERATION {
+                    path := get_dot_path(xx bin_op.left, null);
                     current_node = get_path_type(path);
+                } else {
+                    current_node = get_path_type(.[bin_op.left]);
+                }
+            } else {
+                current_node = null;
             }
 
             continue;

@@ -126,9 +126,10 @@ run_diagnostics :: () {
         }
     });
 
-    if file != server.previously_errored_file {
-        free(server.previously_errored_file);
-    }
-
+    // Swap before freeing to avoid use-after-free window
+    old := server.previously_errored_file;
     server.previously_errored_file = file;
+    if file != old {
+        free(old);
+    }
 }

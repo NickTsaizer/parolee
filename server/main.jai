@@ -34,9 +34,16 @@ Server :: struct {
     deferred_total: int;       // total queued for percentage calc
     deferred_processed: int;
     needs_reanalyze: bool;
+    diagnostics_pending: bool;   // run diagnostics after message response sent
+    token_busy: bool;            // rate-limit: skip if semantic tokens already processing
+    skip_reanalyze: bool;        // init: skip get_files_that_use (O(n²) overhead, no existing files need reanalysis)
+
+    files_mutex: Mutex;          // thread-safe access to server.files + server.files_to_be_analyzed
+    deferred_mutex: Mutex;       // thread-safe access to server.deferred_imports
+    parse_workers: int;          // 0 = auto (CPU count - 1)
 
     memory_files_lock: Mutex;
-    memory_files: Table(string, [..]u8); // @todo: This is probably dumb - store files as array of lines instead (is this good idea?) // @ToDo: Keep track of a modified flag per file
+    memory_files: Table(string, Mem_File); // @ToDo: Keep track of a modified flag per file
 
     previously_errored_file: string;
 
@@ -66,7 +73,8 @@ decode_url :: (url: string) -> string {
             j += 1;
         }
 
-        if out_url[i] != #char "%" || out_url[i+1] == 0 {
+        // Need at least 2 more chars for %XX escape
+        if out_url[i] != #char "%" || i + 2 >= out_url.count {
             out_url[j] = out_url[i];
             continue;
         }
@@ -272,6 +280,11 @@ get_root_from_initialization :: (body: LSP_Request_Message_Initialize) -> (bool,
     return false, "";
 }
 
+// ── Request Handler ─────────────────────────────────────────────────────
+// @TODO: Refactor into method dispatch table — Handler_Proc type + HANDLERS map.
+// Currently uses inline switch for simplicity; each case should become a
+// dedicated handle_XXX function registered at init time.
+
 handle_request :: (request: LSP_Request_Message, raw_request: string) {
     // log("Got %", request.method);
 
@@ -330,7 +343,13 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             log("Server.roots: %", server.roots);
             log("Server.intermediate_path: %", server.intermediate_path);
 
+            // Init mutexes for parallel deferred import processing
+            init(*server.files_mutex);
+            init(*server.deferred_mutex);
+
             // Parse Runtime Support and Preload (needed for built-in type resolution)
+            server.skip_reanalyze = true;
+            defer server.skip_reanalyze = false;
             {
                 parse_file(tprint("%/modules/Runtime_Support.jai", server.args.jai_path), true);
                 parse_file(tprint("%/modules/Preload.jai", server.args.jai_path), true);
@@ -357,7 +376,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
                 return;
             }
 
-            run_diagnostics();
+            server.diagnostics_pending = true;
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
 
@@ -383,8 +402,9 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             server.shallow_parse = false;
             server.needs_reanalyze = false;
 
-            analyze_files();
-            run_diagnostics();
+            // Defer analyze_files until background import resolution completes
+            // (skips expensive get_file_links scan — re-runs in main loop anyway)
+            server.diagnostics_pending = true;
 
             log("File_path: %", file_path);
 
@@ -508,7 +528,11 @@ main :: () {
     server.files_to_be_analyzed.allocator = context.default_allocator;
 
     init_memory_files();
-    defer deinit_memory_files();
+    defer {
+        deinit_memory_files();
+        destroy(*server.files_mutex);
+        destroy(*server.deferred_mutex);
+    }
 
     while !server.quit {
         body, success := read_message_from_stdin(,, temp);
@@ -525,18 +549,34 @@ main :: () {
 
         handle_request(request, body);
 
-        // Process one deferred import per message cycle (background resolution)
+PROGRESS_TOKEN :: "jails-parse";
+
+        // Process deferred imports in batches (up to 8 per cycle) for faster startup
         if server.deferred_imports.count > 0 {
-            // Capture total on first import — only notify if substantial
             if server.deferred_processed == 0 {
                 server.deferred_total = server.deferred_imports.count;
+                send_progress_begin(PROGRESS_TOKEN, "Indexing", tprint("Parsing imports (%)", server.deferred_total));
             }
 
-            path := server.deferred_imports[0];
-            array_ordered_remove_by_index(*server.deferred_imports, 0);
-            parse_file(path);
-            server.deferred_processed += 1;
-            server.needs_reanalyze = true;
+            // Parallel for large batches, sequential for small (avoids thread overhead)
+            PARALLEL_THRESHOLD :: 4;
+            batch_size := min(8, server.deferred_imports.count);
+            if batch_size >= PARALLEL_THRESHOLD {
+                process_batch_parallel(batch_size);
+            } else {
+                while batch_size > 0 {
+                    batch_size -= 1;
+                    path := server.deferred_imports[0];
+                    array_ordered_remove_by_index(*server.deferred_imports, 0);
+                    parse_file(path);
+                    server.deferred_processed += 1;
+                    server.needs_reanalyze = true;
+                }
+            }
+
+            if server.deferred_imports.count > 0 {
+                send_progress_report(PROGRESS_TOKEN, tprint("%/% imports", server.deferred_processed, server.deferred_total));
+            }
         }
 
         // Re-analyze when all deferred imports are done
@@ -545,7 +585,14 @@ main :: () {
             analyze_files();
             server.deferred_total = 0;
             server.deferred_processed = 0;
+            send_progress_end(PROGRESS_TOKEN, "Indexing complete");
             log("Background analysis complete");
+        }
+
+        // Run pending diagnostics AFTER message response (non-blocking for current request)
+        if server.diagnostics_pending {
+            server.diagnostics_pending = false;
+            run_diagnostics();
         }
 
         reset_temporary_storage();
@@ -594,4 +641,65 @@ main :: () {
     #import "Windows";
 } else {
     #import "POSIX";
+}
+
+// ── Parallel deferred import processing (batch model) ──────────────────
+// Processes up to BATCH_SIZE items per call using worker threads.
+// Each batch is self-contained: spawn workers → wait → cleanup.
+// Main loop returns between batches so LSP stays responsive.
+
+Worker_Data :: struct {
+    start: int;
+    count: int;
+}
+
+parse_deferred_worker :: (thread: *Thread) -> s64 {
+    data := cast(*Worker_Data) thread.data;
+    for 0..data.count-1 {
+        idx := data.start + it;
+        path := server.deferred_imports[idx];
+        parse_file(path);
+    }
+    return 0;
+}
+
+process_batch_parallel :: (batch_size: int) {
+    num_workers := max(1, get_number_of_processors() - 1);
+    if num_workers > batch_size num_workers = batch_size;
+
+    items_per_worker := batch_size / num_workers;
+    remainder := batch_size % num_workers;
+
+    threads: [..]*Thread;
+    start_idx: int;
+
+    for 0..num_workers-1 {
+        count := items_per_worker;
+        if it < remainder count += 1;
+
+        thread := New(Thread);
+        data := New(Worker_Data);
+        data.start = start_idx;
+        data.count = count;
+        thread.data = data;
+
+        thread_init(thread, parse_deferred_worker);
+        thread_start(thread);
+        array_add(*threads, thread);
+        start_idx += count;
+    }
+
+    for threads {
+        thread_deinit(it);
+        free(it.data);
+        free(it);
+    }
+    array_free(threads);
+
+    // Remove processed items from queue (they were parsed by index, not popped)
+    for 0..batch_size-1 {
+        array_ordered_remove_by_index(*server.deferred_imports, 0);
+    }
+    server.deferred_processed += batch_size;
+    server.needs_reanalyze = true;
 }

@@ -15,16 +15,13 @@ read_from_stdin :: (buffer: *u8, bytes_to_read: u64) -> u64 {
         #if OS != .WINDOWS { // Linux, MacOS
             read_this_time = posix.read(posix.STDIN_FILENO, buffer+readed, bytes_to_read-readed);
             if read_this_time < 0 {
-              // probably EAGAIN or EINTR?
               err := posix.errno();
               if err != posix.EINTR && err != posix.EAGAIN {
                   log_error("Reading the stdin failed with errno: %", posix.errno());
                   return readed;
-              } else {
-                  // we should retry
               }
             } else if read_this_time == 0 {
-              // probably closed (EOF)
+              // EOF — client disconnected
               return readed;
             } else {
               readed += xx read_this_time;

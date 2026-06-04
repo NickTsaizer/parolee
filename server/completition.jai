@@ -280,7 +280,9 @@ handle_assignment_completitions :: (request: LSP_Request_Message_Completion, cur
         return false;
     }
 
-    if op.operation != .ASSIGN && op.operation != .IS_EQUAL && op.operation != .IS_NOT_EQUAL {
+    // Any binary operation with a resolvable left side triggers left-side completions.
+    // DOT operations are handled separately by handle_dot_completitions.
+    if op.operation == .DOT {
         return false;
     }
 

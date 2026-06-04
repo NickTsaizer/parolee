@@ -23,3 +23,6 @@ bin/
 
 # Notes for future self
 last.md
+
+# Session files
+.tmp/
