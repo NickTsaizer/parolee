@@ -317,10 +317,12 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
             // Defer import parsing: collect path for background resolution
             // Copy using default allocator — current context is pool, freed on re-parse
             if path.count > 0 {
+                lock(*server.deferred_mutex);
                 saved := context.allocator;
                 context.allocator = context.default_allocator;
                 array_add_if_unique(*server.deferred_imports, copy_string(path));
                 context.allocator = saved;
+                unlock(*server.deferred_mutex);
             }
         } else {
             if path.count > 0 parse_file(path); // @TODO: Run this in another thread?
@@ -352,10 +354,12 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
         load_relative_path := join(data.path_without_filename, _load.file, separator="/");
         array_add(*data.file.loads, _load);
         if server.shallow_parse {
+            lock(*server.deferred_mutex);
             saved := context.allocator;
             context.allocator = context.default_allocator;
             array_add_if_unique(*server.deferred_imports, copy_string(load_relative_path));
             context.allocator = saved;
+            unlock(*server.deferred_mutex);
         } else {
             if load_relative_path.count > 0 parse_file(load_relative_path); // @TODO: Run this in another thread?
         }
@@ -803,6 +807,20 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
 
 get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *Node.Location = null, name := "", only_loaded := false) -> []*Declaration {
     decls: [..]*Declaration;
+
+    // Include file's own declarations first — available immediately after didOpen
+    // (linked_files is only populated after analyze_files, which runs post-indexing)
+    if file {
+        if name.count > 0 {
+            for decl: table_find_multiple(*file.declarations, name) {
+                if is_global(decl, file, file, false) array_add(*decls, decl);
+            }
+        } else {
+            for decl: file.declarations {
+                if is_global(decl, file, file, false) array_add(*decls, decl);
+            }
+        }
+    }
 
     // Globals in all linked files (loaded or imported)
     if file {

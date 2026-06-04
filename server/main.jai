@@ -36,11 +36,19 @@ Server :: struct {
     needs_reanalyze: bool;
     diagnostics_pending: bool;   // run diagnostics after message response sent
     token_busy: bool;            // rate-limit: skip if semantic tokens already processing
+    progress_cycle: int;         // unique token per batch progress cycle
     skip_reanalyze: bool;        // init: skip get_files_that_use (O(n²) overhead, no existing files need reanalysis)
 
     files_mutex: Mutex;          // thread-safe access to server.files + server.files_to_be_analyzed
     deferred_mutex: Mutex;       // thread-safe access to server.deferred_imports
     parse_workers: int;          // 0 = auto (CPU count - 1)
+
+    // I/O thread — reads stdin continuously, queues messages, signals main thread
+    io_thread: Thread;
+    io_queue: [..]string;        // message bodies queued by I/O thread for main thread
+    io_queue_mutex: Mutex;       // guards io_queue
+    io_signal_r: s32 = -1;       // self-pipe read end (polled by main thread)
+    io_signal_w: s32 = -1;       // self-pipe write end (signaled by I/O thread)
 
     memory_files_lock: Mutex;
     memory_files: Table(string, Mem_File); // @ToDo: Keep track of a modified flag per file
@@ -501,60 +509,35 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
     }
 }
 
-// ── Message drain ──────────────────────────────────────────────────────
-// Reads and processes ALL pending messages from stdin without blocking.
-// Returns when no more data is available (poll returns false).
-
-drain_pending_messages :: () {
-    while stdin_wait(1) {  // 1ms — brief wait allows pipe buffer to catch up with burst messages
-        body, success := read_message_from_stdin(,, temp);
-        if !success {
-            log("Failed to read message. Skipping.");
-            break;
-        }
-
-        parseOK, request := json_parse_string(body, LSP_Request_Message,, temp);
-        if !parseOK {
-            log_error("Unable to parse as json:\n%\n\n", body);
-            continue;
-        }
-
-        handle_request(request, body);
-        reset_temporary_storage();
-    }
-}
-
 // ── Import batch processing ─────────────────────────────────────────────
-// Process up to 8 deferred imports in one batch (parallel for ≥4).
-// Re-analyze only when ALL imports complete.
+// Process deferred imports in parallel batches (up to PARALLEL_BATCH files
+// per call). Cycle progress after each batch so Neovim never blocks features
+// behind a long-lived progress window.
 
-PROGRESS_TOKEN :: "jails-parse";
+PARALLEL_BATCH :: 4;
 
 process_import_batch :: () {
     if server.deferred_imports.count == 0 return;
 
+    batch_size := min(PARALLEL_BATCH, server.deferred_imports.count);
+
     if server.deferred_processed == 0 {
         server.deferred_total = server.deferred_imports.count;
-        send_progress_begin(PROGRESS_TOKEN, "Indexing", tprint("Parsing imports (%)", server.deferred_total));
+        server.progress_cycle = 0;
+        send_progress_begin(tprint("jails-parse-%", server.progress_cycle), "Indexing",
+            tprint("Parsing imports (%)", server.deferred_total));
     }
 
-    PARALLEL_THRESHOLD :: 4;
-    batch_size := min(8, server.deferred_imports.count);
-    if batch_size >= PARALLEL_THRESHOLD {
-        process_batch_parallel(batch_size);
-    } else {
-        while batch_size > 0 {
-            batch_size -= 1;
-            path := server.deferred_imports[0];
-            array_ordered_remove_by_index(*server.deferred_imports, 0);
-            parse_file(path);
-            server.deferred_processed += 1;
-            server.needs_reanalyze = true;
-        }
-    }
+    // Process batch in parallel
+    process_batch_parallel(batch_size);
 
+    // Cycle progress per batch: end old window with current token, start new one with fresh token.
+    // Unique token per cycle avoids AstroLSP state confusion from rapid end→begin on same token.
     if server.deferred_imports.count > 0 {
-        send_progress_report(PROGRESS_TOKEN, tprint("%/% imports", server.deferred_processed, server.deferred_total));
+        send_progress_end(tprint("jails-parse-%", server.progress_cycle), "");
+        server.progress_cycle += 1;
+        send_progress_begin(tprint("jails-parse-%", server.progress_cycle), "Indexing",
+            tprint("Parsing imports (%)", server.deferred_processed, server.deferred_total));
     }
 }
 
@@ -564,19 +547,55 @@ finish_analysis_if_complete :: () {
         analyze_files();
         server.deferred_total = 0;
         server.deferred_processed = 0;
-        send_progress_end(PROGRESS_TOKEN, "Indexing complete");
+        send_progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
         log("Background analysis complete");
     }
 }
 
-// ── stdin polling helpers ───────────────────────────────────────────────
-// Check if stdin has pending data using poll() with configurable timeout.
-// timeout_ms=0 → non-blocking peek. timeout_ms>0 → wait up to N ms.
+// ── I/O thread ──────────────────────────────────────────────────────────
+// Dedicated thread that reads stdin continuously, queues raw message bodies,
+// and signals the main thread via a self-pipe. This guarantees messages are
+// received even while the main thread is blocked joining import workers.
 
-stdin_wait :: (timeout_ms: s32) -> bool {
+io_thread_proc :: (thread: *Thread) -> s64 {
+    while !server.quit {
+        body, success := read_message_from_stdin(,, temp);
+        if !success {
+            if server.quit break;
+            // EOF without quit -> client disconnected
+            log("Stdin closed, shutting down");
+            server.quit = true;
+            break;
+        }
+
+        // Copy body to heap -- body's data is in this thread's temp storage.
+        // context.allocator defaults to heap for spawned threads.
+        body_copy := copy_string(body);
+
+        // Queue for main thread
+        lock(*server.io_queue_mutex);
+        array_add(*server.io_queue, body_copy);
+        unlock(*server.io_queue_mutex);
+
+        // Reset temp storage to prevent unbounded growth
+        reset_temporary_storage();
+
+        // Signal main thread via self-pipe
+        sig: u8 = 0;
+        write(cast(s32) server.io_signal_w, *sig, 1);
+    }
+    return 0;
+}
+
+// ── I/O signaling via self-pipe ─────────────────────────────────────────
+// Poll self-pipe read end instead of stdin. I/O thread writes one byte per
+// queued message. Non-blocking peek: 0ms returns immediately, >0 waits up
+// to N ms (acts as idle sleep when no messages pending).
+
+io_wait :: (timeout_ms: s32) -> bool {
     #if OS != .WINDOWS {
         fds: pollfd;
-        fds.fd = STDIN_FILENO;
+        fds.fd = server.io_signal_r;
         fds.events = POLLIN;
         result := poll(*fds, 1, timeout_ms);
         return result > 0 && (fds.revents & POLLIN) != 0;
@@ -584,7 +603,39 @@ stdin_wait :: (timeout_ms: s32) -> bool {
     return false;  // Windows: always returns false (blocking behavior unchanged)
 }
 
-POLL_IDLE_MS :: 5;
+// ── Message drain ──────────────────────────────────────────────────────
+// Dequeues ALL pending messages from the I/O thread's queue and processes
+// them. Drains self-pipe signal bytes first, then processes messages.
+
+drain_io_queue :: () {
+    // Drain signal bytes from self-pipe (non-blocking)
+    sig: u8;
+    while read(server.io_signal_r, *sig, 1) > 0 {}
+
+    // Process all queued messages
+    while true {
+        lock(*server.io_queue_mutex);
+        if server.io_queue.count == 0 {
+            unlock(*server.io_queue_mutex);
+            break;
+        }
+        body := server.io_queue[0];
+        array_ordered_remove_by_index(*server.io_queue, 0);
+        unlock(*server.io_queue_mutex);
+
+        parseOK, request := json_parse_string(body, LSP_Request_Message,, temp);
+        if !parseOK {
+            log_error("Unable to parse as json:\n%\n\n", body);
+            free(body);
+            continue;
+        }
+        handle_request(request, body);
+        free(body);
+        reset_temporary_storage();
+    }
+}
+
+POLL_IDLE_MS :: 20;  // ms — idle wait before background work. poll() returns immediately when data arrives.
 
 main :: () {
     context.logger = lsp_log;
@@ -612,31 +663,75 @@ main :: () {
 
     server.files_to_be_analyzed.allocator = context.default_allocator;
 
+    // Spawn I/O thread — reads stdin continuously, queues messages
+    #if OS != .WINDOWS {
+        pipe_fds: [2]s32;
+        pipe(*pipe_fds);
+        fcntl(pipe_fds[0], F_SETFL, O_NONBLOCK);
+        server.io_signal_r = pipe_fds[0];
+        server.io_signal_w = pipe_fds[1];
+    }
+    thread_init(*server.io_thread, io_thread_proc);
+    thread_start(*server.io_thread);
+
     init_memory_files();
     defer {
+        // Phase-out: signal I/O thread and close stdin to unblock its read
+        server.quit = true;
+        #if OS != .WINDOWS {
+            sig: u8 = 0;
+            write(cast(s32) server.io_signal_w, *sig, 1);  // wake in case not on stdin
+            close(0);                                        // unblock read_from_stdin
+        }
+        thread_deinit(*server.io_thread);
+
         deinit_memory_files();
         destroy(*server.files_mutex);
         destroy(*server.deferred_mutex);
+        destroy(*server.io_queue_mutex);
+        array_free(server.io_queue);
+        #if OS != .WINDOWS {
+            close(server.io_signal_r);
+            close(server.io_signal_w);
+        }
     }
 
     while !server.quit {
         // Phase 1: Check for pending messages (non-blocking peek).
         // If messages are queued, process them ALL before background work.
-        if stdin_wait(0) {
-            drain_pending_messages();
+        if io_wait(0) {
+            drain_io_queue();
+            continue;  // skip background work — more messages may be imminent
         } else {
             // Phase 1b: No data — wait briefly for next message (acts as idle sleep).
             // This prevents busy-wait when the server is idle.
-            if stdin_wait(POLL_IDLE_MS) {
-                drain_pending_messages();
+            if io_wait(POLL_IDLE_MS) {
+                drain_io_queue();
+                continue;  // skip background work — process messages first
             }
         }
 
-        // Phase 2: Process one batch of deferred imports (idle background work)
+        // Phase 2: Process one batch of deferred imports with shallow parse
+        // (keep shallow_parse=true so workers defer transitive imports instead
+        //  of deep-parsing; this keeps batches fast and responsive)
+        server.shallow_parse = true;
         process_import_batch();
+        server.shallow_parse = false;
+
+        // Phase 2b: Re-check for messages — messages may have arrived during import processing
+        if io_wait(0) {
+            drain_io_queue();
+            continue;
+        }
 
         // Phase 3: Re-analyze when all deferred imports are done
         finish_analysis_if_complete();
+
+        // Phase 3b: Re-check — messages may have arrived during analysis
+        if io_wait(0) {
+            drain_io_queue();
+            continue;
+        }
 
         // Phase 4: Run pending diagnostics
         if server.diagnostics_pending {
@@ -697,16 +792,13 @@ main :: () {
 // Main loop returns between batches so LSP stays responsive.
 
 Worker_Data :: struct {
-    start: int;
-    count: int;
+    paths: [..]string;  // local copy — no shared access to deferred_imports during parallel work
 }
 
 parse_deferred_worker :: (thread: *Thread) -> s64 {
     data := cast(*Worker_Data) thread.data;
-    for 0..data.count-1 {
-        idx := data.start + it;
-        path := server.deferred_imports[idx];
-        parse_file(path);
+    for data.paths {
+        parse_file(it);
     }
     return 0;
 }
@@ -727,8 +819,12 @@ process_batch_parallel :: (batch_size: int) {
 
         thread := New(Thread);
         data := New(Worker_Data);
-        data.start = start_idx;
-        data.count = count;
+
+        // Extract paths into local array — no shared access to deferred_imports
+        for 0..count-1 {
+            path := server.deferred_imports[start_idx + it];
+            array_add(*data.paths, path);
+        }
         thread.data = data;
 
         thread_init(thread, parse_deferred_worker);
@@ -741,10 +837,19 @@ process_batch_parallel :: (batch_size: int) {
         thread_deinit(it);
         free(it.data);
         free(it);
+
+        // Interleave message checks between worker completions.
+        // Other workers continue running while main thread drains messages.
+        // This keeps LSP responsive during long-running batches.
+        if io_wait(0) {
+            saved_shallow := server.shallow_parse;
+            drain_io_queue();
+            server.shallow_parse = saved_shallow;  // didOpen may have cleared it
+        }
     }
     array_free(threads);
 
-    // Remove processed items from queue (they were parsed by index, not popped)
+    // Remove processed items from queue
     for 0..batch_size-1 {
         array_ordered_remove_by_index(*server.deferred_imports, 0);
     }

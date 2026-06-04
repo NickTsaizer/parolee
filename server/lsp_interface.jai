@@ -400,19 +400,19 @@ LSP_Failure_Handling_Kind :: enum {
 LSP_Work_Done_Progess_Begin :: struct {
     kind: string = "begin";
     title: string;
-    cancellable: *bool;
-    message: *string;
+    cancellable: bool;
+    message: string;
 }
 
 LSP_Work_Done_Progress_Report :: struct {
     kind: string = "report";
-    cancellable: *bool;
-    message: *string;
+    cancellable: bool;
+    message: string;
 }
 
 LSP_Work_Done_Progress_Done :: struct {
     kind: string = "end";
-    message: *string;
+    message: string;
 }
 
 LSP_Progress_Notification :: struct(Value_Type: Type) {
@@ -427,10 +427,7 @@ LSP_Progress_Notification :: struct(Value_Type: Type) {
 send_progress_begin :: (token: string, title: string, message := "") {
     begin: LSP_Work_Done_Progess_Begin;
     begin.title = title;
-    if message.count > 0 {
-        msg := message;
-        begin.message = *msg;
-    }
+    begin.message = message;
     notif: LSP_Progress_Notification(LSP_Work_Done_Progess_Begin);
     notif.params.token = token;
     notif.params.value = begin;
@@ -439,10 +436,7 @@ send_progress_begin :: (token: string, title: string, message := "") {
 
 send_progress_report :: (token: string, message := "") {
     report: LSP_Work_Done_Progress_Report;
-    if message.count > 0 {
-        msg := message;
-        report.message = *msg;
-    }
+    report.message = message;
     notif: LSP_Progress_Notification(LSP_Work_Done_Progress_Report);
     notif.params.token = token;
     notif.params.value = report;
@@ -451,10 +445,7 @@ send_progress_report :: (token: string, message := "") {
 
 send_progress_end :: (token: string, message := "") {
     done: LSP_Work_Done_Progress_Done;
-    if message.count > 0 {
-        msg := message;
-        done.message = *msg;
-    }
+    done.message = message;
     notif: LSP_Progress_Notification(LSP_Work_Done_Progress_Done);
     notif.params.token = token;
     notif.params.value = done;
