@@ -501,6 +501,91 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
     }
 }
 
+// ── Message drain ──────────────────────────────────────────────────────
+// Reads and processes ALL pending messages from stdin without blocking.
+// Returns when no more data is available (poll returns false).
+
+drain_pending_messages :: () {
+    while stdin_wait(0) {
+        body, success := read_message_from_stdin(,, temp);
+        if !success {
+            log("Failed to read message. Skipping.");
+            break;
+        }
+
+        parseOK, request := json_parse_string(body, LSP_Request_Message,, temp);
+        if !parseOK {
+            log_error("Unable to parse as json:\n%\n\n", body);
+            continue;
+        }
+
+        handle_request(request, body);
+        reset_temporary_storage();
+    }
+}
+
+// ── Import batch processing ─────────────────────────────────────────────
+// Process up to 8 deferred imports in one batch (parallel for ≥4).
+// Re-analyze only when ALL imports complete.
+
+PROGRESS_TOKEN :: "jails-parse";
+
+process_import_batch :: () {
+    if server.deferred_imports.count == 0 return;
+
+    if server.deferred_processed == 0 {
+        server.deferred_total = server.deferred_imports.count;
+        send_progress_begin(PROGRESS_TOKEN, "Indexing", tprint("Parsing imports (%)", server.deferred_total));
+    }
+
+    PARALLEL_THRESHOLD :: 4;
+    batch_size := min(8, server.deferred_imports.count);
+    if batch_size >= PARALLEL_THRESHOLD {
+        process_batch_parallel(batch_size);
+    } else {
+        while batch_size > 0 {
+            batch_size -= 1;
+            path := server.deferred_imports[0];
+            array_ordered_remove_by_index(*server.deferred_imports, 0);
+            parse_file(path);
+            server.deferred_processed += 1;
+            server.needs_reanalyze = true;
+        }
+    }
+
+    if server.deferred_imports.count > 0 {
+        send_progress_report(PROGRESS_TOKEN, tprint("%/% imports", server.deferred_processed, server.deferred_total));
+    }
+}
+
+finish_analysis_if_complete :: () {
+    if server.needs_reanalyze && server.deferred_imports.count == 0 {
+        server.needs_reanalyze = false;
+        analyze_files();
+        server.deferred_total = 0;
+        server.deferred_processed = 0;
+        send_progress_end(PROGRESS_TOKEN, "Indexing complete");
+        log("Background analysis complete");
+    }
+}
+
+// ── stdin polling helpers ───────────────────────────────────────────────
+// Check if stdin has pending data using poll() with configurable timeout.
+// timeout_ms=0 → non-blocking peek. timeout_ms>0 → wait up to N ms.
+
+stdin_wait :: (timeout_ms: s32) -> bool {
+    #if OS != .WINDOWS {
+        fds: pollfd;
+        fds.fd = STDIN_FILENO;
+        fds.events = POLLIN;
+        result := poll(*fds, 1, timeout_ms);
+        return result > 0 && (fds.revents & POLLIN) != 0;
+    }
+    return false;  // Windows: always returns false (blocking behavior unchanged)
+}
+
+POLL_IDLE_MS :: 5;
+
 main :: () {
     context.logger = lsp_log;
 
@@ -535,67 +620,30 @@ main :: () {
     }
 
     while !server.quit {
-        body, success := read_message_from_stdin(,, temp);
-        if !success {
-            log("Failed to read message. Skipping.");
-            continue;
-        }
-
-        parseOK, request := json_parse_string(body, LSP_Request_Message,, temp);
-        if !parseOK {
-            log_error("Unable to parse as json:\n%\n\n", body);
-            continue;
-        }
-
-        handle_request(request, body);
-
-PROGRESS_TOKEN :: "jails-parse";
-
-        // Process deferred imports in batches (up to 8 per cycle) for faster startup
-        if server.deferred_imports.count > 0 {
-            if server.deferred_processed == 0 {
-                server.deferred_total = server.deferred_imports.count;
-                send_progress_begin(PROGRESS_TOKEN, "Indexing", tprint("Parsing imports (%)", server.deferred_total));
-            }
-
-            // Parallel for large batches, sequential for small (avoids thread overhead)
-            PARALLEL_THRESHOLD :: 4;
-            batch_size := min(8, server.deferred_imports.count);
-            if batch_size >= PARALLEL_THRESHOLD {
-                process_batch_parallel(batch_size);
-            } else {
-                while batch_size > 0 {
-                    batch_size -= 1;
-                    path := server.deferred_imports[0];
-                    array_ordered_remove_by_index(*server.deferred_imports, 0);
-                    parse_file(path);
-                    server.deferred_processed += 1;
-                    server.needs_reanalyze = true;
-                }
-            }
-
-            if server.deferred_imports.count > 0 {
-                send_progress_report(PROGRESS_TOKEN, tprint("%/% imports", server.deferred_processed, server.deferred_total));
+        // Phase 1: Check for pending messages (non-blocking peek).
+        // If messages are queued, process them ALL before background work.
+        if stdin_wait(0) {
+            drain_pending_messages();
+        } else {
+            // Phase 1b: No data — wait briefly for next message (acts as idle sleep).
+            // This prevents busy-wait when the server is idle.
+            if stdin_wait(POLL_IDLE_MS) {
+                drain_pending_messages();
             }
         }
 
-        // Re-analyze when all deferred imports are done
-        if server.needs_reanalyze && server.deferred_imports.count == 0 {
-            server.needs_reanalyze = false;
-            analyze_files();
-            server.deferred_total = 0;
-            server.deferred_processed = 0;
-            send_progress_end(PROGRESS_TOKEN, "Indexing complete");
-            log("Background analysis complete");
-        }
+        // Phase 2: Process one batch of deferred imports (idle background work)
+        process_import_batch();
 
-        // Run pending diagnostics AFTER message response (non-blocking for current request)
+        // Phase 3: Re-analyze when all deferred imports are done
+        finish_analysis_if_complete();
+
+        // Phase 4: Run pending diagnostics
         if server.diagnostics_pending {
             server.diagnostics_pending = false;
             run_diagnostics();
         }
 
-        reset_temporary_storage();
         #if MEMORY_DEBUG report_memory_leaks();
     }
 
