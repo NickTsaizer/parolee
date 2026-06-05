@@ -13,6 +13,15 @@ This fork focuses on stability fixes, crash prevention, and incremental performa
 
 In the future, the language server will support all other basic stuff you would get from any other LSP. Also, the plan is to support some specific Jai features from an editor support perspective like for example macro evaluation inside the editor etc.
 
+### Fork improvements
+
+- **Completions never time out** — `get_file_links` (expensive import-graph scan) no longer runs on the completion path. During background analysis, completions return file-local + scope symbols instantly (`~1ms`). No more 10s LSP timeouts.
+- **Cyrillic/CJK/emoji crash fix** — added `positionEncoding = "utf-8"` to server capabilities. Without it, Neovim defaults to UTF-16 offset encoding; multi-byte characters cause out-of-bounds reads → server crash.
+- **44K-item JSON serialization fix** — 300-item hard cap with `isIncomplete=true`. Large projects no longer spend 600-1200ms serializing every declaration as JSON.
+- **Prefix filtering** — completions are filtered by what you've typed (extracts partial word from cursor node). Typing `run` shows 32 relevant items instead of 300 random ones.
+- **Incremental analysis** — `didChange`/`didSave` no longer block the main thread with full import-graph resolution on every keystroke. Analysis processes one file per scheduler-loop iteration with I/O checks between.
+- **Dedicated I/O thread** — separate thread for stdout writes prevents stderr/parser thread contention.
+
 
 ## Usage
 Be aware that this language server is still pretty much unstable... Nonetheless, it can be quite useful even in this early stage of development.
