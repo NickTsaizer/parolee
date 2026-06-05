@@ -11,9 +11,7 @@ This fork focuses on stability fixes, crash prevention, and incremental performa
 - **Autocomplete** — symbols, types, procedures, variables, keywords. Completions appear instantly even in large projects. Filtered by what you've typed.
 - **Go-to Definition** — navigate to symbol definitions across files.
 - **Signature help** — shows parameter info when typing function calls.
-- **Compiler error reporting** — real-time diagnostics from the Jai compiler in your editor.
 - **Background loading** — project imports resolve in the background with a progress indicator. Open files are ready to edit immediately.
-- **Full international support** — works with Cyrillic, CJK, emoji, and any Unicode in source code.
 - **Compatible with Neovim, VS Code, and any LSP client**.
 
 
