@@ -1,6 +1,8 @@
 # parolee
 
-Fork of [SogoCZE/Jails](https://github.com/SogoCZE/Jails) — heavily vibecoded fork of the Jai LSP server.
+Fork of [SogoCZE/Jails](https://github.com/SogoCZE/Jails). The reason this fork exists is my need to store this somewhere, but I do not want to PR vibecoded pieces of code I never checked.
+
+Maybe sometime I polish and PR this, but not now. That's why this code is parolee.
 
 Upstream Jails is an experimental language server for the Jai programming language.
 This fork focuses on stability fixes, crash prevention, and incremental performance improvements — all produced via vibecoding.
@@ -24,13 +26,13 @@ Be aware that this language server is still pretty much unstable... Nonetheless,
 
 ### When using a custom Build program
 By default, Jails does not generate any output files, however, when using a custom build program it will output whatever your build program is set to. In that case, you should disable the output on your own, by combining `JAILS_DIAGNOSTICS_BUILD` with `#exists` to detect if it is build by the LSP.
-```odin
+```jai
 #if #exists(JAILS_DIAGNOSTICS_BUILD) options.output_type = .NO_OUTPUT;
 ```
 
 If you happen to have more than one layer of meta programms triggering, you can do the following:
 
-```odin
+```jai
 default_metaprogram_command_lind := get_build_options(1).compile_time_command_line;
 found, index := array_find(default_metaprogram_command_lind, "jails_diagnostics");
 if found  child_options.output_type = .NO_OUTPUT;
