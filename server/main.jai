@@ -30,6 +30,7 @@ Server :: struct {
 
     // Deferred parsing: imports queued for background resolution
     shallow_parse: bool;
+    follow_all_imports: bool;   // true=follow ALL #import (root file); false=only wrapped_in_decl (imported files)
     deferred_imports: [..]string;
     deferred_total: int;       // total queued for percentage calc
     deferred_processed: int;
@@ -674,7 +675,7 @@ worker_proc :: (thread: *Thread) -> s64 {
 
         // Execute
         if task.type == .parse_import {
-            parse_file(task.file_path, false, task.shallow);
+            parse_file(task.file_path, false, task.shallow, false); // imported → restrict transitive
         }
 
         // Signal completion — main thread polls done_pipe_r

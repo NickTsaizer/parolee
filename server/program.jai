@@ -134,7 +134,7 @@ pool_alloc :: (pool: *Pool) -> Allocator {
     return .{pool_allocator_proc, pool};
 }
 
-parse_file :: (input_path: string, force := false, shallow := false) {
+parse_file :: (input_path: string, force := false, shallow := false, follow_all := true) {
     // Reset back to default allocator, we dont want to use pool from "parent" file...
     context.allocator = context.default_allocator;
 
@@ -144,6 +144,13 @@ parse_file :: (input_path: string, force := false, shallow := false) {
     saved_shallow := server.shallow_parse;
     server.shallow_parse = shallow;
     defer server.shallow_parse = saved_shallow;
+
+    // follow_all: root file gets all imports resolved; imported files
+    // only follow 'using X :: #import "X"' declarations to prevent recursive
+    // transitive loading (e.g. Basic → #import "POSIX" → 100+ modules).
+    saved_follow_all := server.follow_all_imports;
+    server.follow_all_imports = follow_all;
+    defer server.follow_all_imports = saved_follow_all;
 
     path := normalize_path(input_path);
 
@@ -225,6 +232,23 @@ parse_file :: (input_path: string, force := false, shallow := false) {
         for file_using_this_file: files_using_this_file {
             array_add_if_unique(*server.files_to_be_analyzed, file_using_this_file);
         }
+    }
+
+    // Seed linked_files with Preload + Runtime_Support immediately so
+    // completions have access to their declarations even before background
+    // analysis runs (which overwrites linked_files with the full set).
+    if file.linked_files.count == 0 {
+        linked: [..]Linked_File;
+        for f: server.files {
+            if f == file continue;
+            preload_or_runtime: bool;
+            if contains(f.path, "Preload.jai")        preload_or_runtime = true;
+            if contains(f.path, "Runtime_Support.jai") preload_or_runtime = true;
+            if preload_or_runtime {
+                array_add(*linked, .{ file=f, from_import=true });
+            }
+        }
+        file.linked_files = linked;
     }
     unlock(*server.files_mutex);
 }
@@ -401,19 +425,25 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
             array_add(*data.file.imports, module_import);
         }
 
-        if server.shallow_parse {
-            // Defer import parsing: collect path for background resolution
-            // Copy using default allocator — current context is pool, freed on re-parse
-            if path.count > 0 {
-                lock(*server.deferred_mutex);
-                saved := context.allocator;
-                context.allocator = context.default_allocator;
-                array_add_if_unique(*server.deferred_imports, copy_string(path));
-                context.allocator = saved;
-                unlock(*server.deferred_mutex);
+        // follow_all=true (root file): follow EVERY #import (bare + using).
+        // follow_all=false (imported file): only follow wrapped_in_decl —
+        // prevents recursive transitive loading (e.g. Basic → #import "POSIX").
+        root_or_wrapped := server.follow_all_imports || wrapped_in_decl || wrapped_in_bare_using;
+        if root_or_wrapped {
+            if server.shallow_parse {
+                // Defer import parsing: collect path for background resolution
+                // Copy using default allocator — current context is pool, freed on re-parse
+                if path.count > 0 {
+                    lock(*server.deferred_mutex);
+                    saved := context.allocator;
+                    context.allocator = context.default_allocator;
+                    array_add_if_unique(*server.deferred_imports, copy_string(path));
+                    context.allocator = saved;
+                    unlock(*server.deferred_mutex);
+                }
+            } else {
+                if path.count > 0 parse_file(path, false, false, false); // imported → restrict transitive
             }
-        } else {
-            if path.count > 0 parse_file(path); // @TODO: Run this in another thread?
         }
     }
 
@@ -449,7 +479,7 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
             context.allocator = saved;
             unlock(*server.deferred_mutex);
         } else {
-            if load_relative_path.count > 0 parse_file(load_relative_path); // @TODO: Run this in another thread?
+            if load_relative_path.count > 0 parse_file(load_relative_path, false, false, false); // imported → restrict transitive
         }
     }
 

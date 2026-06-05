@@ -255,6 +255,8 @@ emit_directive_string :: (node: *Node, entries: *[..]Token_Entry) {
 
 add_entry :: (line: int, col: int, len: int, tt: u32, mod: u32, entries: *[..]Token_Entry) {
     if len <= 0 return;
+    if col < 0 return;   // negative col = bogus position, skip
+    if line < 0 return;  // negative line = bogus position, skip
     entry: Token_Entry = .{line=xx line, character=xx col, length=xx len, token_type=tt, token_modifiers=mod};
     array_add(entries, entry);
 }
