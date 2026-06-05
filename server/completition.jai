@@ -19,6 +19,9 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     }
 
     cursor_node := get_node_by_location(file, cursor_location);
+    dot_ok := false;
+    dot_fields: [..]*Declaration;
+    // (dot_fields populated by handle_dot_completitions below)
 
     if cursor_node {
         // We don't wanna to give completions inside strings.
@@ -37,9 +40,7 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
             return;
         }
 
-        if handle_dot_completitions(request, cursor_node, cursor_location) {
-            return;
-        }
+        dot_ok, dot_fields = handle_dot_completitions(request, cursor_node, cursor_location);
 
         if handle_assignment_completitions(request, cursor_node) {
             return;
@@ -60,6 +61,14 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
 
     // General
     decls := get_declarations(file, cursor_node, *cursor_location);
+
+    // Prepend type fields from dot completions (e.g. my_var. → fields first)
+    if dot_ok && dot_fields.count > 0 {
+        combined: [..]*Declaration;
+        array_add(*combined, .. dot_fields);
+        array_add(*combined, .. decls);
+        decls = combined;
+    }
 
     // Extract prefix: what user has typed so far.
     // If cursor is on an IDENTIFIER, its name is the partial word.
@@ -139,9 +148,11 @@ handle_completitions_import :: (request: LSP_Request_Message_Completion, directi
     lsp_respond(request.id, completions);
 }
 
-handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_node: *Node, cursor_location: Node.Location) -> bool {
+handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_node: *Node, cursor_location: Node.Location) -> (bool, [..]*Declaration) {
+    empty: [..]*Declaration;
+
     if !cursor_node {
-        return false;
+        return false, empty;
     }
 
     op: *Binary_Operation;
@@ -150,7 +161,7 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
     } else if is_dot_binary_op(cursor_node.parent) {
         op = cast(*Binary_Operation) cursor_node.parent;
     } else {
-        return false;
+        return false, empty;
     }
 
     root_binary_op := op;
@@ -164,7 +175,7 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
     }
 
     if root_binary_op.operation != .DOT {
-        return false;
+        return false, empty;
     }
 
     path: [..]*Node;
@@ -189,11 +200,14 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
 
     type := get_path_type(path);
     if !type {
-        lsp_respond(request.id, null);
-        return true;
+        return false, empty;
     }
 
-    return handle_completitions_for_node(request, type);
+    fields := get_type_fields(type);
+    if fields.count > 0 {
+        return true, fields;
+    }
+    return false, empty;
 }
 
 handle_types_in_declaration :: (request: LSP_Request_Message_Completion, cursor_node: *Node) -> bool {
@@ -332,36 +346,29 @@ handle_assignment_completitions :: (request: LSP_Request_Message_Completion, cur
     return handle_completitions_for_node(request, left_type);
 }
 
-handle_completitions_for_node :: (request: LSP_Request_Message_Completion, node: *Node) -> bool {
+// Collect type fields for a node without sending any response.
+// Returns decls in declaration form (caller converts to LSP items).
+get_type_fields :: (node: *Node) -> [..]*Declaration {
     decls: [..]*Declaration;
-    defer array_free(decls);
 
-    // This is a macro so the declaration survive until parent scope.
+    // Macro so inline-declared arrays survive to parent scope.
     add_decls_from_internal_array_struct :: (decls: *[..]*Declaration, resizable: bool, type: *Node) #expand {
         internal_array_struct := get_internal_array_struct(resizable);
-        if !internal_array_struct {
-            return;
-        }
+        if !internal_array_struct { return; }
 
         for member: internal_array_struct.block.members {
-            if member.kind != .DECLARATION {
-                continue;
-            }
-
+            if member.kind != .DECLARATION continue;
             decl := cast(*Declaration) member;
             if decl.name == "data" && type {
                 data_decl := Declaration.{
                     name = "data",
                     type_inst = *(Unary_Operation.{
-                        operation=.POINTER,
-                        expression=type
+                        operation=.POINTER, expression=type
                     }),
                 };
-
                 array_add(decls, *data_decl);
                 continue;
             }
-
             array_add(decls, decl);
         }
     }
@@ -378,51 +385,47 @@ handle_completitions_for_node :: (request: LSP_Request_Message_Completion, node:
 
         case .IDENTIFIER;
             identifier := cast(*Identifier, node);
-
-            if identifier.name == {
-                case "string";
-                    internal_string_struct := get_internal_string_struct();
-                    if internal_string_struct {
-                        return handle_completitions_for_node(request, internal_string_struct);
-                    }
+            if identifier.name == "string" {
+                internal_string_struct := get_internal_string_struct();
+                if internal_string_struct {
+                    inner := get_type_fields(internal_string_struct);
+                    array_add(*decls, .. inner);
+                }
             }
 
         case .LITERAL;
             literal := cast(*Literal, node);
-
-            if literal.value_type == {
-                case .STRING;
-                    internal_string_struct := get_internal_string_struct();
-                    if internal_string_struct {
-                        return handle_completitions_for_node(request, internal_string_struct);
-                    }
-
-                case .ARRAY;
-                    array_literal_info := literal.values.array_literal_info;
-                    add_decls_from_internal_array_struct(*decls, false, array_literal_info.element_type);
+            if literal.value_type == .STRING {
+                internal_string_struct := get_internal_string_struct();
+                if internal_string_struct {
+                    inner := get_type_fields(internal_string_struct);
+                    array_add(*decls, .. inner);
+                }
+            } else if literal.value_type == .ARRAY {
+                array_literal_info := literal.values.array_literal_info;
+                add_decls_from_internal_array_struct(*decls, false, array_literal_info.element_type);
             }
 
         case .DIRECTIVE_IMPORT;
             import := cast(*Directive_Import) node;
-
             module_file_path := get_module_import_path(import, node.location.file);
             module_file := get_file(module_file_path);
-
-            if !module_file {
-                return false;
-            }
-
-            for get_declarations(module_file, only_loaded=true) {
-                array_add(*decls, it);
+            if module_file {
+                for get_declarations(module_file, only_loaded=true) {
+                    array_add(*decls, it);
+                }
             }
     }
 
-    // if decls.count == 0 {
-    //     return false;
-    // }
+    return decls;
+}
 
+handle_completitions_for_node :: (request: LSP_Request_Message_Completion, node: *Node) -> bool {
+    decls := get_type_fields(node);
+    if decls.count == 0 {
+        return false;
+    }
     send_completions_decls(request, decls);
-
     return true;
 }
 
