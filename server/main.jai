@@ -43,6 +43,23 @@ Server :: struct {
     deferred_mutex: Mutex;       // thread-safe access to server.deferred_imports
     parse_workers: int;          // 0 = auto (CPU count - 1)
 
+    // Async worker pool — persistent threads, never spawn/join per batch
+    worker_threads: [..]*Thread;
+    num_workers: int;
+    task_queue: [..]Task;
+    task_queue_mutex: Mutex;
+    task_signal_r: s32 = -1;     // workers poll this for new tasks
+    task_signal_w: s32 = -1;     // main thread writes to signal workers
+    done_pipe_r: s32 = -1;       // main thread polls for worker completions
+    done_pipe_w: s32 = -1;       // workers write 1 byte when done
+    busy_workers: int;           // tracks in-flight tasks; under task_queue_mutex
+
+    // Async output queue — all lsp_send calls queue here; main thread flushes to stdout
+    // in scheduler loop. Eliminates risk of worker holding stdout mutex during print()
+    // while main thread blocks waiting to respond to LSP request (stdout pipe deadlock).
+    output_queue: [..]string;
+    output_queue_mutex: Mutex;
+
     // I/O thread — reads stdin continuously, queues messages, signals main thread
     io_thread: Thread;
     io_queue: [..]string;        // message bodies queued by I/O thread for main thread
@@ -58,6 +75,13 @@ Server :: struct {
     diagnostics_metaprogram_path: string;
 
     user_options: User_Options;
+
+    // Incremental analysis: process one file per scheduler loop iteration
+    // to avoid blocking the main thread for seconds during get_file_links.
+    analysis_pending: bool;       // true when analysis work remains
+    analysis_index: int = -1;     // index into files_to_be_analyzed, -1 = not started
+    preload_file: *Program_File;  // cached preload file (found once per batch)
+    runtime_support_file: *Program_File; // cached runtime support file (found once per batch)
 }
 
 server: Server;
@@ -388,8 +412,9 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
 
+            // Full re-parse + incremental analysis (non-blocking, scheduler loop)
             parse_file(file_path, true);
-            analyze_files();
+            finish_analysis_if_complete();
 
         case "textDocument/didOpen";
             success, body := json_parse_string(raw_request, LSP_Did_Open_Text_Document,, temp);
@@ -405,9 +430,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             create_memory_file(file_path, content);
 
             // Shallow parse: current file only, imports deferred to background
-            server.shallow_parse = true;
-            parse_file(file_path, true);
-            server.shallow_parse = false;
+            parse_file(file_path, true, true);
             server.needs_reanalyze = false;
 
             // Defer analyze_files until background import resolution completes
@@ -425,10 +448,10 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
             edit_memory_file(file_path, body.params.contentChanges);
-            server.shallow_parse = true;
+            // Full parse (not shallow) — marks file for re-analysis; scheduler loop
+            // handles incremental link resolution one file at a time.
             parse_file(file_path, true);
-            server.shallow_parse = false;
-            analyze_files();
+            finish_analysis_if_complete();
 
         case "textDocument/documentSymbol";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Document_Symbol);
@@ -509,47 +532,223 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
     }
 }
 
-// ── Import batch processing ─────────────────────────────────────────────
-// Process deferred imports in parallel batches (up to PARALLEL_BATCH files
-// per call). Cycle progress after each batch so Neovim never blocks features
-// behind a long-lived progress window.
+// ── Import dispatch (async worker pool) ────────────────────────────────
+// Push deferred imports to worker queue up to batch size.
+// Workers run persistently — main thread never blocks on join.
+// Progress cycles per dispatch batch.
 
 PARALLEL_BATCH :: 4;
 
-process_import_batch :: () {
-    if server.deferred_imports.count == 0 return;
+dispatch_imports :: () {
+    lock(*server.deferred_mutex);
+    count := server.deferred_imports.count;
+    unlock(*server.deferred_mutex);
+    if count == 0 return;
 
-    batch_size := min(PARALLEL_BATCH, server.deferred_imports.count);
+    lock(*server.task_queue_mutex);
+    already_busy := server.busy_workers;
+    unlock(*server.task_queue_mutex);
+    if already_busy >= server.num_workers return;
 
+    batch_size := min(PARALLEL_BATCH, count);
+    available := server.num_workers - already_busy;
+    if batch_size > available batch_size = available;
+
+    // Start or cycle progress
     if server.deferred_processed == 0 {
+        lock(*server.deferred_mutex);
         server.deferred_total = server.deferred_imports.count;
+        unlock(*server.deferred_mutex);
         server.progress_cycle = 0;
         send_progress_begin(tprint("jails-parse-%", server.progress_cycle), "Indexing",
             tprint("Parsing imports (%)", server.deferred_total));
-    }
-
-    // Process batch in parallel
-    process_batch_parallel(batch_size);
-
-    // Cycle progress per batch: end old window with current token, start new one with fresh token.
-    // Unique token per cycle avoids AstroLSP state confusion from rapid end→begin on same token.
-    if server.deferred_imports.count > 0 {
+    } else {
         send_progress_end(tprint("jails-parse-%", server.progress_cycle), "");
         server.progress_cycle += 1;
         send_progress_begin(tprint("jails-parse-%", server.progress_cycle), "Indexing",
             tprint("Parsing imports (%)", server.deferred_processed, server.deferred_total));
     }
+
+    // Push tasks to worker queue (never spawn/join).
+    // Tasks carry their own shallow flag — workers apply it locally.
+    // deferred_mutex held for entire batch to prevent races with workers
+    // concurrently adding new deferred imports during node_visit.
+    lock(*server.deferred_mutex);
+    for 0..batch_size-1 {
+        path := server.deferred_imports[0];
+        array_ordered_remove_by_index(*server.deferred_imports, 0);
+        push_task(Task.{ type = .parse_import, file_path = path, shallow = true });
+        server.deferred_processed += 1;
+    }
+    unlock(*server.deferred_mutex);
+    server.needs_reanalyze = true;
 }
 
 finish_analysis_if_complete :: () {
-    if server.needs_reanalyze && server.deferred_imports.count == 0 {
-        server.needs_reanalyze = false;
-        analyze_files();
-        server.deferred_total = 0;
-        server.deferred_processed = 0;
+    if server.analysis_pending return;  // still processing last batch, don't double-start
+
+    lock(*server.deferred_mutex);
+    remaining := server.deferred_imports.count;
+    unlock(*server.deferred_mutex);
+    if !server.needs_reanalyze || remaining > 0 return;
+
+    lock(*server.task_queue_mutex);
+    idle := server.busy_workers == 0;
+    unlock(*server.task_queue_mutex);
+    if !idle return;
+
+    server.needs_reanalyze = false;
+    server.deferred_total = 0;
+    server.deferred_processed = 0;
+
+    // Start incremental analysis (processes one file per scheduler loop iteration)
+    if server.files_to_be_analyzed.count > 0 {
+        process_analysis_step();  // kick off — processes first file
+    } else {
         send_progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
         log("Background analysis complete");
     }
+}
+
+// ── Task types for async worker pool ────────────────────────────────────
+// Workers pull tasks from a shared queue. For parse_batch, the worker spawns
+// sub-threads (up to BATCH_SIZE) to process imports in parallel, then waits
+// for all sub-threads before signaling completion to the main thread.
+
+BATCH_SIZE :: 4;
+
+Task_Type :: enum u32 {
+    parse_import;   // single file: worker parses + spawns sub-workers for its imports
+    parse_batch;    // batch of paths: spawns sub-workers for each
+}
+
+Task :: struct {
+    type: Task_Type;
+    file_path: string;   // for parse_import
+    shallow: bool;       // run parse_file with shallow_parse=true
+    batch_len: s32;      // number of valid paths in batch[] (0..BATCH_SIZE)
+    batch: [BATCH_SIZE]string;  // paths for parse_batch (heap-allocated copies)
+}
+
+// ── Worker pool ─────────────────────────────────────────────────────────
+// Push a task to the shared queue and signal one worker. Thread-safe.
+
+push_task :: (task: Task) {
+    lock(*server.task_queue_mutex);
+    array_add(*server.task_queue, task);
+    server.busy_workers += 1;
+    unlock(*server.task_queue_mutex);
+
+    // Signal one worker to wake up and grab the task
+    sig: u8 = 0;
+    write(cast(s32) server.task_signal_w, *sig, 1);
+}
+
+// Persistent worker thread procedure. Loops until quit: wait for signal,
+// pop task from queue, execute, signal completion.
+
+worker_proc :: (thread: *Thread) -> s64 {
+    context.logger = lsp_log;
+    fds: pollfd;
+    fds.events = POLLIN;
+
+    while !server.quit {
+        // Block until task available or quit
+        fds.fd = cast(s32) server.task_signal_r;
+        poll(*fds, 1, -1);
+        if server.quit break;
+
+        // Drain signal byte
+        sig: u8;
+        read(cast(s32) server.task_signal_r, *sig, 1);
+
+        // Pop task
+        lock(*server.task_queue_mutex);
+        if server.task_queue.count == 0 {
+            unlock(*server.task_queue_mutex);
+            continue;
+        }
+        task := server.task_queue[0];
+        array_ordered_remove_by_index(*server.task_queue, 0);
+        unlock(*server.task_queue_mutex);
+
+        // Execute
+        if task.type == .parse_import {
+            parse_file(task.file_path, false, task.shallow);
+        }
+
+        // Signal completion — main thread polls done_pipe_r
+        sig = 0;
+        write(cast(s32) server.done_pipe_w, *sig, 1);
+    }
+    return 0;
+}
+
+// Spawn persistent worker threads at startup.
+// Workers persist for the lifetime of the server — no per-batch spawn/join.
+
+start_worker_pool :: () {
+    num := server.parse_workers;
+    if num <= 0 num = max(1, get_number_of_processors() - 1);
+    server.num_workers = num;
+
+    // Create pipes for task signaling and completion signaling
+    #if OS != .WINDOWS {
+        tfd: [2]s32;
+        dfd: [2]s32;
+        pipe(*tfd); pipe(*dfd);
+        fcntl(tfd[0], F_SETFL, O_NONBLOCK);
+        fcntl(dfd[0], F_SETFL, O_NONBLOCK);
+        server.task_signal_r = tfd[0]; server.task_signal_w = tfd[1];
+        server.done_pipe_r = dfd[0];   server.done_pipe_w = dfd[1];
+    }
+
+    for 0..num-1 {
+        thread := New(Thread);
+        thread_init(thread, worker_proc);
+        thread_start(thread);
+        array_add(*server.worker_threads, thread);
+    }
+}
+
+// Drain completion pipe — decrement busy_workers for each completed task.
+
+drain_completions :: () {
+    sig: u8;
+    count: int;
+    while read(cast(s32) server.done_pipe_r, *sig, 1) > 0 {
+        count += 1;
+    }
+    if count > 0 {
+        lock(*server.task_queue_mutex);
+        server.busy_workers -= count;
+        unlock(*server.task_queue_mutex);
+    }
+}
+
+// Flush queued output to stdout. Called from scheduler loop — never from workers.
+// Swaps the queue with an empty array under lock, then writes all messages to stdout.
+// Never holds lock during print(), so workers can queue messages concurrently.
+
+flush_output_queue :: () {
+    msgs: [..]string;
+    msgs.allocator = context.default_allocator;
+
+    lock(*server.output_queue_mutex);
+    n := server.output_queue.count;
+    if n > 0 {
+        for 0..n-1 {
+            array_add(*msgs, server.output_queue[it]);
+        }
+        server.output_queue.count = 0;
+    }
+    unlock(*server.output_queue_mutex);
+
+    for msg: msgs {
+        print("Content-Length: %\r\n\r\n%", msg.count, msg);
+        free(msg);
+    }
+    array_free(msgs);
 }
 
 // ── I/O thread ──────────────────────────────────────────────────────────
@@ -663,6 +862,10 @@ main :: () {
 
     server.files_to_be_analyzed.allocator = context.default_allocator;
 
+    // Async output queue — no mutex contention, flushed from scheduler loop
+    server.output_queue.allocator = context.default_allocator;
+    init(*server.output_queue_mutex);
+
     // Spawn I/O thread — reads stdin continuously, queues messages
     #if OS != .WINDOWS {
         pipe_fds: [2]s32;
@@ -674,75 +877,116 @@ main :: () {
     thread_init(*server.io_thread, io_thread_proc);
     thread_start(*server.io_thread);
 
+    // Spawn persistent worker pool — never spawn/join per batch
+    init(*server.task_queue_mutex);
+    start_worker_pool();
+
     init_memory_files();
+
+    // ── Cleanup on shutdown ──────────────────────────────────────────────
     defer {
-        // Phase-out: signal I/O thread and close stdin to unblock its read
         server.quit = true;
+
+        // Wake I/O thread: signal pipe + close stdin to unblock read_from_stdin
         #if OS != .WINDOWS {
             sig: u8 = 0;
-            write(cast(s32) server.io_signal_w, *sig, 1);  // wake in case not on stdin
-            close(0);                                        // unblock read_from_stdin
+            write(cast(s32) server.io_signal_w, *sig, 1);
+            write(cast(s32) server.task_signal_w, *sig, 1);  // wake workers
+            close(0);
         }
         thread_deinit(*server.io_thread);
+        for server.worker_threads { thread_deinit(it); }
+        array_free(server.worker_threads);
 
         deinit_memory_files();
         destroy(*server.files_mutex);
         destroy(*server.deferred_mutex);
         destroy(*server.io_queue_mutex);
+        destroy(*server.task_queue_mutex);
+        destroy(*server.output_queue_mutex);
+        array_free(server.output_queue);
         array_free(server.io_queue);
         #if OS != .WINDOWS {
-            close(server.io_signal_r);
-            close(server.io_signal_w);
+            close(server.io_signal_r); close(server.io_signal_w);
+            close(server.task_signal_r); close(server.task_signal_w);
+            close(server.done_pipe_r); close(server.done_pipe_w);
         }
     }
 
+    // ── Scheduler loop ───────────────────────────────────────────────────
+    // Poll both I/O pipe (new LSP messages) and completion pipe (workers done).
+    // Dispatch deferred imports to worker pool when capacity available.
+    // Never blocks on thread_deinit — workers run persistently.
+    // Flush output queue after each phase to batch stdout writes safely.
+
     while !server.quit {
-        // Phase 1: Check for pending messages (non-blocking peek).
-        // If messages are queued, process them ALL before background work.
-        if io_wait(0) {
-            drain_io_queue();
-            continue;  // skip background work — more messages may be imminent
-        } else {
-            // Phase 1b: No data — wait briefly for next message (acts as idle sleep).
-            // This prevents busy-wait when the server is idle.
-            if io_wait(POLL_IDLE_MS) {
-                drain_io_queue();
-                continue;  // skip background work — process messages first
+        #if OS != .WINDOWS {
+            fds: [2]pollfd;
+            fds[0].fd = cast(s32) server.io_signal_r;
+            fds[0].events = POLLIN;
+            fds[1].fd = cast(s32) server.done_pipe_r;
+            fds[1].events = POLLIN;
+            result := poll(fds.data, 2, POLL_IDLE_MS);
+
+            if result > 0 {
+                if fds[0].revents & POLLIN drain_io_queue();
+                if fds[1].revents & POLLIN drain_completions();
             }
+        } else {
+            // Windows: poll not available, fall back to basic loop
+            if io_wait(0) { drain_io_queue(); }
+            Sleep(20);
         }
 
-        // Phase 2: Process one batch of deferred imports with shallow parse
-        // (keep shallow_parse=true so workers defer transitive imports instead
-        //  of deep-parsing; this keeps batches fast and responsive)
-        server.shallow_parse = true;
-        process_import_batch();
-        server.shallow_parse = false;
+        flush_output_queue();
 
-        // Phase 2b: Re-check for messages — messages may have arrived during import processing
+        // Dispatch deferred imports to async worker pool
+        // Workers carry their own shallow flag; scheduler never toggles it.
+        dispatch_imports();
+
+        flush_output_queue();
+
+        // Re-check for messages (more may have arrived during dispatch)
         if io_wait(0) {
             drain_io_queue();
-            continue;
         }
 
-        // Phase 3: Re-analyze when all deferred imports are done
+        // Check analysis complete (requires busy_workers == 0)
         finish_analysis_if_complete();
 
-        // Phase 3b: Re-check — messages may have arrived during analysis
-        if io_wait(0) {
-            drain_io_queue();
-            continue;
+        // Incremental analysis: process files one-at-a-time, checking I/O
+        // between each. This prevents blocking the main thread for seconds
+        // when get_file_links iterates hundreds of server.files entries.
+        while server.analysis_pending {
+            process_analysis_step();
+            flush_output_queue();
+            if io_wait(0) {
+                drain_io_queue();
+                flush_output_queue();
+            }
+            if server.quit break;
         }
 
-        // Phase 4: Run pending diagnostics
+        flush_output_queue();
+
+        // Run pending diagnostics when idle
         if server.diagnostics_pending {
-            server.diagnostics_pending = false;
-            run_diagnostics();
+            lock(*server.task_queue_mutex);
+            idle := server.busy_workers == 0;
+            unlock(*server.task_queue_mutex);
+            if idle {
+                server.diagnostics_pending = false;
+                run_diagnostics();
+            }
         }
 
         #if MEMORY_DEBUG report_memory_leaks();
     }
 
-    log("Shutdown");
+    // Flush any remaining output before exit — ensures shutdown response is sent
+    flush_output_queue();
+    // Don't call log() here — it would add to output_queue without flushing,
+    // and the temp-allocated string data could be corrupted on exit.
     exit(0);
 }
 
@@ -786,73 +1030,4 @@ main :: () {
     #import "POSIX";
 }
 
-// ── Parallel deferred import processing (batch model) ──────────────────
-// Processes up to BATCH_SIZE items per call using worker threads.
-// Each batch is self-contained: spawn workers → wait → cleanup.
-// Main loop returns between batches so LSP stays responsive.
 
-Worker_Data :: struct {
-    paths: [..]string;  // local copy — no shared access to deferred_imports during parallel work
-}
-
-parse_deferred_worker :: (thread: *Thread) -> s64 {
-    data := cast(*Worker_Data) thread.data;
-    for data.paths {
-        parse_file(it);
-    }
-    return 0;
-}
-
-process_batch_parallel :: (batch_size: int) {
-    num_workers := max(1, get_number_of_processors() - 1);
-    if num_workers > batch_size num_workers = batch_size;
-
-    items_per_worker := batch_size / num_workers;
-    remainder := batch_size % num_workers;
-
-    threads: [..]*Thread;
-    start_idx: int;
-
-    for 0..num_workers-1 {
-        count := items_per_worker;
-        if it < remainder count += 1;
-
-        thread := New(Thread);
-        data := New(Worker_Data);
-
-        // Extract paths into local array — no shared access to deferred_imports
-        for 0..count-1 {
-            path := server.deferred_imports[start_idx + it];
-            array_add(*data.paths, path);
-        }
-        thread.data = data;
-
-        thread_init(thread, parse_deferred_worker);
-        thread_start(thread);
-        array_add(*threads, thread);
-        start_idx += count;
-    }
-
-    for threads {
-        thread_deinit(it);
-        free(it.data);
-        free(it);
-
-        // Interleave message checks between worker completions.
-        // Other workers continue running while main thread drains messages.
-        // This keeps LSP responsive during long-running batches.
-        if io_wait(0) {
-            saved_shallow := server.shallow_parse;
-            drain_io_queue();
-            server.shallow_parse = saved_shallow;  // didOpen may have cleared it
-        }
-    }
-    array_free(threads);
-
-    // Remove processed items from queue
-    for 0..batch_size-1 {
-        array_ordered_remove_by_index(*server.deferred_imports, 0);
-    }
-    server.deferred_processed += batch_size;
-    server.needs_reanalyze = true;
-}

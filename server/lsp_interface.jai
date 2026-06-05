@@ -548,6 +548,11 @@ LSP_Result_Initialize :: struct {
             save := true;
             change := 2;
         };
+
+        // Tell clients we use raw UTF-8 byte offsets, not UTF-16 code units.
+        // Without this, LSP defaults to UTF-16; multi-byte characters (Cyrillic,
+        // CJK, emoji) cause offset mismatch → out-of-bounds reads → crash.
+        positionEncoding := "utf-8";
     };
 
     serverInfo: struct {
@@ -846,6 +851,16 @@ LSP_Document_Symbol_Params :: struct {
 }
 
 lsp_log :: (message : string, data : *void, info : Log_Info) {
+    // Suppress parser token-mismatch noise (harmless — jai_parser chokes on
+    // $op: Simd_Op compile-time param syntax in SIMD files).
+    if info.common_flags == .ERROR {
+        if find_index_from_left(message, "token ") >= 0 &&
+           find_index_from_left(message, "!= required") >= 0
+        {
+            return;
+        }
+    }
+
     sent_log: LSP_Log_Message = .{};
     sent_log.params.message = message;
 
@@ -876,8 +891,16 @@ lsp_window_message :: (format: string, args: ..Any, type: LSP_Window_Show_Messag
 
 lsp_send :: (data: $T) {
     body := json_write_string(data);
-    defer free(body);
-    print("Content-Length: %\r\n\r\n%", body.count, body);
+    // Deep copy to heap — callers (workers) may allocate in temp storage
+    // that gets freed after task loop iteration, leaving dangling pointers.
+    saved := context.allocator;
+    context.allocator = context.default_allocator;
+    body_copy := copy_string(body);
+    context.allocator = saved;
+
+    lock(*server.output_queue_mutex);
+    array_add(*server.output_queue, body_copy);
+    unlock(*server.output_queue_mutex);
 }
 
 lsp_respond :: (id: JSON_Value, data: $T) {
@@ -908,6 +931,16 @@ lsp_respond :: (id: JSON_Value, data: $T) {
 
 //     print("Content-Length: %\r\n\r\n%", final_body.count, final_body);
 // }
+
+// Completion list wrapper with isIncomplete flag.
+// When the results are truncated (>MAX_COMPLETIONS items), the client knows
+// to re-request as the user types more characters.
+MAX_COMPLETIONS :: 300;
+
+LSP_Completion_List :: struct {
+    isIncomplete: bool;
+    items: []LSP_Completion_Item;
+}
 
 lsp_respond_with_error :: (id: JSON_Value, code: LSP_Error_Codes, message: string, data: $T) {
     reply: struct {

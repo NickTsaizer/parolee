@@ -17,6 +17,8 @@ Program_File :: struct {
 
     ast_pool: Pool;
     analysis_pool: Pool;
+
+    mutex: Mutex;  // guards declarations + nodes during concurrent worker access
 }
 
 Linked_File :: struct {
@@ -51,6 +53,7 @@ array_count_declaration := Declaration.{
 
 deinit_file :: (using file: Program_File) {
     deinit(*declarations);
+    destroy(*file.mutex);
     array_free(nodes);
     array_free(loads);
     array_free(imports);
@@ -68,7 +71,9 @@ reset_file :: (using file: Program_File) {
 }
 
 get_file :: (path: string) -> *Program_File {
+    lock(*server.files_mutex);
     ok, file := table_find(*server.files, path);
+    unlock(*server.files_mutex);
     if !ok return null;
     return file;
 }
@@ -129,9 +134,16 @@ pool_alloc :: (pool: *Pool) -> Allocator {
     return .{pool_allocator_proc, pool};
 }
 
-parse_file :: (input_path: string, force := false) {
+parse_file :: (input_path: string, force := false, shallow := false) {
     // Reset back to default allocator, we dont want to use pool from "parent" file...
     context.allocator = context.default_allocator;
+
+    // Thread-safe shallow flag: each caller passes its own value.
+    // No global state mutation — node_visit reads server.shallow_parse
+    // which is set per parse_file call.
+    saved_shallow := server.shallow_parse;
+    server.shallow_parse = shallow;
+    defer server.shallow_parse = saved_shallow;
 
     path := normalize_path(input_path);
 
@@ -151,6 +163,7 @@ parse_file :: (input_path: string, force := false) {
         file.path = copy_string(path);
         set_allocators(*file.ast_pool, context.default_allocator);
         set_allocators(*file.analysis_pool, context.default_allocator);
+        init(*file.mutex);
         table_add(*server.files, file.path, file);
         unlock(*server.files_mutex);
     }
@@ -216,6 +229,8 @@ parse_file :: (input_path: string, force := false) {
     unlock(*server.files_mutex);
 }
 
+// Full analysis: processes all files in files_to_be_analyzed at once.
+// Used from initialize/didSave/didChange where the batch is small.
 analyze_files :: () {
     for file: server.files_to_be_analyzed {
         release(*file.analysis_pool);
@@ -255,6 +270,75 @@ analyze_files :: () {
     array_reset(*server.files_to_be_analyzed);
 }
 
+// Incremental analysis: process ONE file per call from the scheduler loop.
+// Returns false when all files in files_to_be_analyzed are done (and sends
+// "Indexing complete" progress message).
+// This prevents blocking the main thread for seconds during get_file_links
+// when the import tree has hundreds of files.
+process_analysis_step :: () -> bool {
+    if !server.analysis_pending {
+        // First call — discover the batch
+        for f: server.files_to_be_analyzed {
+            release(*f.analysis_pool);
+        }
+
+        server.preload_file = null;
+        server.runtime_support_file = null;
+        for f: server.files {
+            if !server.runtime_support_file && contains(f.path, "Runtime_Support.jai") {
+                server.runtime_support_file = f;
+            }
+            if !server.preload_file && contains(f.path, "Preload.jai") {
+                server.preload_file = f;
+            }
+        }
+
+        server.analysis_index = 0;
+        server.analysis_pending = true;
+    }
+
+    if server.analysis_index >= server.files_to_be_analyzed.count {
+        // All done
+        array_reset(*server.files_to_be_analyzed);
+        server.analysis_pending = false;
+        server.analysis_index = -1;
+        server.preload_file = null;
+        server.runtime_support_file = null;
+        send_progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
+        log("Background analysis complete");
+        return false;
+    }
+
+    file := server.files_to_be_analyzed[server.analysis_index];
+    server.analysis_index += 1;
+
+    linked_files := get_file_links(file,, pool_alloc(*file.analysis_pool));
+
+    if file != server.preload_file && server.preload_file {
+        array_add(*linked_files, .{ file=server.preload_file, from_import=true });
+    }
+
+    if file != server.runtime_support_file && server.runtime_support_file {
+        array_add(*linked_files, .{ file=server.runtime_support_file, from_import=true });
+    }
+
+    file.linked_files = linked_files;
+
+    // Check if this was the last one
+    if server.analysis_index >= server.files_to_be_analyzed.count {
+        array_reset(*server.files_to_be_analyzed);
+        server.analysis_pending = false;
+        server.analysis_index = -1;
+        server.preload_file = null;
+        server.runtime_support_file = null;
+        send_progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
+        log("Background analysis complete");
+        return false;
+    }
+
+    return true; // more files remain
+}
+
 Node_Visit_Data :: struct {
     file: *Program_File;
     global_members: [..]*Node;
@@ -268,6 +352,9 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
     push_allocator(data.allocator);
 
     file := data.file;
+
+    lock(*file.mutex);
+    // defer unlock(*file.mutex);  // can't use defer — push_allocator above changes context
 
     if node.kind == .COMPOUND_DECLARATION {
         compound_declaration := cast(*Compound_Declaration) node;
@@ -293,6 +380,7 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
     }
 
     array_add(*file.nodes, node);
+    unlock(*file.mutex);
 
     if node.kind == .DIRECTIVE_IMPORT {
         _import := cast(*Directive_Import) node;
@@ -808,8 +896,9 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
 get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *Node.Location = null, name := "", only_loaded := false) -> []*Declaration {
     decls: [..]*Declaration;
 
-    // Include file's own declarations first — available immediately after didOpen
-    // (linked_files is only populated after analyze_files, which runs post-indexing)
+    // File's own declarations — available immediately after didOpen.
+    // linked_files is populated later by analyze_files() after background
+    // import resolution completes.
     if file {
         if name.count > 0 {
             for decl: table_find_multiple(*file.declarations, name) {
@@ -822,11 +911,12 @@ get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *No
         }
     }
 
-    // Globals in all linked files (loaded or imported)
+    // Globals in all linked files (loaded or imported).
+    // linked_files is populated by analyze_files() after background import
+    // resolution completes. During indexing (linked_files empty), completions
+    // return only the file's own declarations — fast, no timeout.
     if file {
         for linked_file: file.linked_files {
-            // log("Linked file: %", linked_file.file.path);
-
             if only_loaded && linked_file.from_import {
                 continue;
             }
@@ -867,6 +957,9 @@ get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *No
             //     }
             // }
 
+            // Protect against concurrent modification by worker threads
+            // (workers call parse_file -> node_visit -> table_add(*file.declarations))
+            lock(*linked_file.file.mutex);
             // We are searching for specific decl
             if name.count > 0 {
                 for decl: table_find_multiple(*linked_file.file.declarations, name) {
@@ -877,6 +970,7 @@ get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *No
                     if is_global(decl, file, linked_file.file, linked_file.from_import) array_add(*decls, decl);
                 }
             }
+            unlock(*linked_file.file.mutex);
         }
     }
 
@@ -1002,11 +1096,7 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
             if !next_file continue;
 
             found: bool;
-            if it.is_using {
-                found = is_avaiable_from_impl(next_file, path, already_checked, false);
-            } else {
-                found = is_avaiable_from_impl(next_file, path, already_checked, true);
-            }
+            found = is_avaiable_from_impl(next_file, path, already_checked, false);
 
             if found {
                 from_import = true;

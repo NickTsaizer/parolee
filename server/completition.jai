@@ -1,5 +1,4 @@
 
-
 handle_completitions :: (request: LSP_Request_Message_Completion) {
     push_allocator(temp);
 
@@ -54,67 +53,24 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
             return;
         }
 
-        // if handle_completitions_procedure_call(request, file, cursor_node, *cursor_location) {
-        //     return;
-        // }
+        if handle_struct_literal_completitions(request, cursor_node) {
+            return;
+        }
     }
 
     // General
     decls := get_declarations(file, cursor_node, *cursor_location);
-    send_completions_decls(request, decls, should_add_basic_keywords=true);
+
+    // Extract prefix: what user has typed so far.
+    // If cursor is on an IDENTIFIER, its name is the partial word.
+    prefix: string;
+    if cursor_node && cursor_node.kind == .IDENTIFIER {
+        ident := cast(*Identifier) cursor_node;
+        prefix = ident.name;
+    }
+
+    send_completions_decls(request, decls, should_add_basic_keywords=true, file=file, prefix=prefix);
 }
-
-// handle_completitions_procedure_call :: (request: LSP_Request_Message_Completion, file: *Program_File, cursor_node: *Node, cursor_location: *Node.Location) -> bool {
-//     proc_call := cast(*Procedure_Call) get_node_nearest_parent(cursor_node, kind => kind == .PROCEDURE_CALL);
-//     if !proc_call {
-//         return false;
-//     }
-
-//     if !proc_call.procedure || proc_call.procedure.kind != .IDENTIFIER {
-//         return false;
-//     }
-//     procedure_ident := cast(*Identifier) proc_call.procedure;
-
-//     decls := get_declarations(file, procedure_ident, cursor_location, procedure_ident.name);
-//     if decls.count == 0 {
-//         return false;
-//     }
-
-//     procedure_decl := decls[0];
-//     if !procedure_decl.expression || procedure_decl.expression.kind != .PROCEDURE {
-//         return false;
-//     }
-
-//     procedure := cast(*Procedure) procedure_decl.expression;
-
-//     completions: [..]LSP_Completion_Item;
-
-//     for arg: procedure.arguments {
-//         if arg.kind != .DECLARATION && arg.kind != .POLYMORPHIC_CONSTANT {
-//             continue;
-//         }
-
-//         unwrapped := unwrap_polymorphic_constant(arg);
-//         if !unwrapped {
-//             continue;
-//         }
-
-//         assert(unwrapped.kind == .DECLARATION);
-
-//         decl := cast(*Declaration) unwrapped;
-
-//         array_add(*completions, LSP_Completion_Item.{
-//             label=decl.name,
-//             insertText=tprint("%=$0", decl.name),
-//             kind=xx LSP_Completion_Item.Kind.Property,
-//             insertTextFormat=xx LSP_Completion_Item.Insert_Text_Format.SNIPPET,
-//         });
-//     }
-
-//     lsp_respond(request.id, completions);
-//     return true;
-// }
-
 handle_completitions_load :: (request: LSP_Request_Message_Completion, file: *Program_File, directive_load: *Directive_Load) {
     completions: [..]LSP_Completion_Item;
     current_file_dir := path_strip_filename(file.path);
@@ -268,6 +224,83 @@ handle_case_completions :: (request: LSP_Request_Message_Completion, cursor_node
     }
 
     return false;
+}
+
+handle_struct_literal_completitions :: (request: LSP_Request_Message_Completion, cursor_node: *Node) -> bool {
+    // Walk up parent chain to find enclosing struct literal
+    literal_node: *Literal;
+    current := cursor_node;
+    while current {
+        if current.kind == .LITERAL && current.(*Literal).value_type == Literal.Value_Type.STRUCT {
+            literal_node = cast(*Literal) current;
+            break;
+        }
+        current = current.parent;
+    }
+
+    if !literal_node return false;
+
+    // Get struct type — either explicit (Vector3.{...}) or inferred (.{...})
+    type_node := literal_node.values.struct_literal_info.type;
+
+    if !type_node {
+        // Dotless struct literal — infer type from parent declaration
+        parent := literal_node.parent;
+        while parent {
+            if parent.kind == .DECLARATION {
+                decl := cast(*Declaration) parent;
+                if decl.type_inst {
+                    if decl.type_inst.kind == .TYPE_INSTANTIATION {
+                        ti := cast(*Type_Instantiation) decl.type_inst;
+                        type_node = ti.expression;
+                    } else {
+                        type_node = decl.type_inst;
+                    }
+                }
+                break;
+            }
+            parent = parent.parent;
+        }
+    }
+
+    if !type_node return false;
+
+    // Resolve identifier to actual struct/type node
+    resolved_type := get_node_type(type_node);
+    if !resolved_type resolved_type = type_node;
+
+    // Get all fields of the struct type
+    all_fields: [..]*Declaration;
+    defer array_free(all_fields);
+    add_all_fields_of(*all_fields, resolved_type);
+
+    if all_fields.count == 0 return false;
+
+    // Get already-assigned field names from the struct literal body
+    assigned: [..]string;
+    defer array_free(assigned);
+    for body_node: literal_node.values.struct_literal_info.body {
+        if body_node.kind == .BINARY_OPERATION {
+            op := cast(*Binary_Operation) body_node;
+            if op.operation == .ASSIGN && op.left && op.left.kind == .IDENTIFIER {
+                array_add(*assigned, op.left.(*Identifier).name);
+            }
+        }
+    }
+
+    // Filter out already-assigned fields
+    result: [..]*Declaration;
+    defer array_free(result);
+    for field: all_fields {
+        skip := false;
+        for assigned_name: assigned {
+            if field.name == assigned_name { skip = true; break; }
+        }
+        if !skip array_add(*result, field);
+    }
+
+    send_completions_decls(request, result);
+    return true;
 }
 
 handle_assignment_completitions :: (request: LSP_Request_Message_Completion, cursor_node: *Node) -> bool {
@@ -426,7 +459,65 @@ add_basic_keywords :: (completions: *[..]LSP_Completion_Item) {
     array_add(completions, .{label="using", insertText="using", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
 }
 
-send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*Declaration, should_add_basic_keywords := false) {
+get_comment_before_decl :: (file: *Program_File, decl: *Declaration) -> string {
+    if !file || file.comments.count == 0 return "";
+
+    decl_line := decl.location.l0;
+    collected: [..]string;
+    defer array_free(collected);
+
+    // Expected line where the comment's last content line should be:
+    // Jai lexer sets l1 to line AFTER consuming newline, so effective last line is l1 - 1.
+    expect_line := decl_line - 1;
+    i := file.comments.count - 1;
+    while i >= 0 {
+        comment := file.comments[i];
+        i -= 1;
+
+        // comment.l1 is the line after the newline was consumed
+        // effective last line of content = l1 - 1
+        comment_last_line := comment.l1 - 1;
+
+        // Skip comments that end on or after the declaration line
+        if comment_last_line >= decl_line continue;
+
+        gap := expect_line - comment_last_line;
+        if gap == 0 {
+            // Comment ends on expected line — include if standalone (not trailing inline)
+            if comment.c0 < 8 {
+                // Strip leading whitespace
+                text := comment.string_value;
+                start := 0;
+                while start < text.count && text[start] <= #char " " { start += 1; }
+                if start < text.count {
+                    trimmed: string;
+                    trimmed.data = text.data + start;
+                    trimmed.count = text.count - start;
+                    array_add(*collected, copy_string(trimmed));
+                }
+                expect_line = comment_last_line - 1;
+            }
+            // else: inline comment (trailing after code) — skip, don't break
+        } else if gap > 0 && collected.count > 0 {
+            break;  // blank line separates doc block from declaration
+        }
+    }
+
+    if collected.count == 0 return "";
+
+    array_reverse(collected);
+
+    builder: String_Builder;
+    first := true;
+    for collected {
+        if !first append(*builder, "\n");
+        first = false;
+        append(*builder, it);
+    }
+    return builder_to_string(*builder);
+}
+
+send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*Declaration, should_add_basic_keywords := false, file: *Program_File = null, prefix: string = "") {
     completions: [..]LSP_Completion_Item;
     defer array_free(completions);
 
@@ -440,8 +531,12 @@ send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*De
         return builder_to_string(*builder);
     }
 
+    truncated := false;
     for decl: decls {
         if !decl.expression && !decl.type_inst continue;
+
+        // Filter by what user typed. Empty prefix = no filter.
+        if prefix.count > 0 && !begins_with(decl.name, prefix) continue;
 
         preview_node: *Node;
         if decl.expression {
@@ -455,6 +550,7 @@ send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*De
         item.insertText = decl.name;
         item.insertTextFormat=xx LSP_Completion_Item.Insert_Text_Format.SNIPPET;
         item.labelDetails.description = "---";
+        item.documentation = get_comment_before_decl(file, decl);
 
         if preview_node.kind == {
             case .PROCEDURE;
@@ -484,7 +580,18 @@ send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*De
         }
 
         array_add(*completions, item);
+
+        // Safety cap: if prefix-filtered results still exceed MAX_COMPLETIONS,
+        // mark incomplete so the client re-requests as user types more.
+        if completions.count >= MAX_COMPLETIONS {
+            truncated = true;
+            break;
+        }
     }
 
-    lsp_respond(request.id, completions);
+    if truncated {
+        lsp_respond(request.id, LSP_Completion_List.{isIncomplete=true, items=completions});
+    } else {
+        lsp_respond(request.id, completions);
+    }
 }
