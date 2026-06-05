@@ -1,5 +1,9 @@
-# Jails
-Jails is an experimental language server for the Jai programming language.
+# parolee
+
+Fork of [SogoCZE/Jails](https://github.com/SogoCZE/Jails) — heavily vibecoded fork of the Jai LSP server.
+
+Upstream Jails is an experimental language server for the Jai programming language.
+This fork focuses on stability fixes, crash prevention, and incremental performance improvements — all produced via vibecoding.
 
 ## Features
 - Basic Go-To Definition
