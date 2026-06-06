@@ -84,19 +84,23 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
                                 }
                             } else if member.kind == .DECLARATION && member.(*Declaration).name == extract_dot_var_name {
                                 decl := cast(*Declaration) member;
-                                if decl.expression {
-                                    if decl.expression.kind == .IDENTIFIER {
-                                        expr_ident := cast(*Identifier) decl.expression;
+                                // Handle "var: Type;" pattern (type_inst set)
+                                type_source: *Node = decl.type_inst;
+                                // Handle "var :: Type;" pattern (expression set)
+                                if !type_source { type_source = decl.expression; }
+                                if type_source {
+                                    if type_source.kind == .IDENTIFIER {
+                                        ts_ident := cast(*Identifier) type_source;
                                         type_decls := get_declarations(
-                                            get_file(expr_ident.location.file),
-                                            expr_ident, *expr_ident.location,
-                                            expr_ident.name
+                                            get_file(ts_ident.location.file),
+                                            ts_ident, *ts_ident.location,
+                                            ts_ident.name
                                         );
                                         if type_decls.count > 0 {
                                             type_node = get_node_type(type_decls[0]);
                                         }
                                     } else {
-                                        type_node = get_node_type(decl.expression);
+                                        type_node = get_node_type(type_source);
                                     }
                                 }
                             }
@@ -139,42 +143,23 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
         }
     }
 
+    // Dot completions: only struct fields/constants, no keywords or general decls.
+    if dot_ok && dot_fields.count > 0 {
+        send_completions_decls(request, dot_fields, file=file);
+        return;
+    }
+
     // General
     decls := get_declarations(file, cursor_node, *cursor_location);
 
-    // Prepend type fields from dot completions (e.g. my_var. → fields first)
-    // Order: dot fields → basic keywords → general declarations
-    if dot_ok && dot_fields.count > 0 {
-        // Convert basic keywords to Declaration wrappers and insert between
-        // dot fields and general declarations
-        keywords: [..]LSP_Completion_Item;
-        defer array_free(keywords);
-        add_basic_keywords(*keywords);
-        keyword_decls: [..]*Declaration;
-        defer array_free(keyword_decls);
-        for kw: keywords {
-            kd := New(Declaration);
-            kd.name = copy_string(kw.label);
-            kd.expression = *empty_identifier;
-            array_add(*keyword_decls, kd);
-        }
-
-        combined: [..]*Declaration;
-        array_add(*combined, .. dot_fields);
-        array_add(*combined, .. keyword_decls);
-        array_add(*combined, .. decls);
-        decls = combined;
-    }
-
     // Extract prefix: what user has typed so far.
-    // If cursor is on an IDENTIFIER, its name is the partial word.
     prefix: string;
     if cursor_node && cursor_node.kind == .IDENTIFIER {
         ident := cast(*Identifier) cursor_node;
         prefix = ident.name;
     }
 
-    send_completions_decls(request, decls, should_add_basic_keywords=false, file=file, prefix=prefix);
+    send_completions_decls(request, decls, file=file, prefix=prefix);
 }
 handle_completitions_load :: (request: LSP_Request_Message_Completion, file: *Program_File, directive_load: *Directive_Load) {
     completions: [..]LSP_Completion_Item;
@@ -354,20 +339,23 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
                     }
                 } else if member.kind == .DECLARATION && member.(*Declaration).name == var_name {
                     // Pattern 2: "var :: Type;" → DECLARATION node
+                    // Pattern 3: "var: Type;" → DECLARATION node (type_inst set)
                     decl := cast(*Declaration) member;
-                    if decl.expression {
-                        if decl.expression.kind == .IDENTIFIER {
-                            expr_ident := cast(*Identifier) decl.expression;
+                    type_source: *Node = decl.type_inst;
+                    if !type_source { type_source = decl.expression; }
+                    if type_source {
+                        if type_source.kind == .IDENTIFIER {
+                            ts_ident := cast(*Identifier) type_source;
                             type_decls := get_declarations(
-                                get_file(expr_ident.location.file),
-                                expr_ident, *expr_ident.location,
-                                expr_ident.name
+                                get_file(ts_ident.location.file),
+                                ts_ident, *ts_ident.location,
+                                ts_ident.name
                             );
                             if type_decls.count > 0 {
                                 type_node = get_node_type(type_decls[0]);
                             }
                         } else {
-                            type_node = get_node_type(decl.expression);
+                            type_node = get_node_type(type_source);
                         }
                     }
                 }
