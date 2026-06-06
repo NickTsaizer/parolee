@@ -19,28 +19,108 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     }
 
     cursor_node := get_node_by_location(file, cursor_location);
+
+    // When cursor_node is null, check if there's a `.` before the cursor.
+    // This handles positions past node boundaries (e.g., after `e.` where the
+    // binary_op ends at the dot but cursor is at the newline).
     dot_ok := false;
     dot_fields: [..]*Declaration;
-    // (dot_fields populated by handle_dot_completitions below)
+    if !cursor_node && cursor_location.c0 > 0 {
+        lsp_pos: LSP_Position;
+        lsp_pos.line = cast(u32) cursor_location.l0;
+        lsp_pos.character = cast(u32) cursor_location.c0;
+        line_text := find_line_in_memory_file(file_path, lsp_pos);
+        if line_text.count > 0 && cursor_location.c0 - 1 < line_text.count {
+            ch := line_text[cursor_location.c0 - 1];
+            if ch == #char "." {
+                    extract_dot_var_name: string;
+                var_start := cursor_location.c0 - 2;
+                while var_start >= 0 && line_text[var_start] != #char " " && line_text[var_start] != #char "\t" {
+                    var_start -= 1;
+                }
+                if var_start < cursor_location.c0 - 2 {
+                    start_i := var_start + 1;
+                    var_len := cursor_location.c0 - 2 - start_i + 1;
+                    if var_len > 0 {
+                        extract_dot_var_name = copy_string(to_string(*line_text[start_i], var_len));
+                    }
+                }
+                if extract_dot_var_name.count > 0 {
+                    // get_node_by_location with .BLOCK filter often fails because
+                    // the parser sometimes doesn't set accurate end locations on BLOCKs.
+                    // Manually scan file.nodes for the deepest (last) BLOCK starting
+                    // at or before the cursor line.
+                    block_node: *Node = null;
+                    for node: file.nodes {
+                        if node.kind == .BLOCK && node.location.l0 <= cursor_location.l0 {
+                            block_node = node;
+                        }
+                    }
+                    if block_node {
+                        block := cast(*Block) block_node;
+                        for member, idx: block.members {
+                            if member.location.l0 > cursor_location.l0 {
+                                continue;
+                            }
+                            if member.location.l0 == cursor_location.l0 && member.location.c0 > cursor_location.c0 {
+                                continue;
+                            }
+
+                            type_node: *Node;
+                            if member.kind == .IDENTIFIER && member.(*Identifier).name == extract_dot_var_name {
+                                if idx > 0 {
+                                    prev := block.members[idx - 1];
+                                    if prev.kind == .IDENTIFIER {
+                                        prev_ident := cast(*Identifier) prev;
+                                        type_decls := get_declarations(
+                                            get_file(prev_ident.location.file),
+                                            prev, *prev.location,
+                                            prev_ident.name
+                                        );
+                                        if type_decls.count > 0 {
+                                            type_node = get_node_type(type_decls[0]);
+                                        }
+                                    }
+                                }
+                            } else if member.kind == .DECLARATION && member.(*Declaration).name == extract_dot_var_name {
+                                decl := cast(*Declaration) member;
+                                if decl.expression {
+                                    if decl.expression.kind == .IDENTIFIER {
+                                        expr_ident := cast(*Identifier) decl.expression;
+                                        type_decls := get_declarations(
+                                            get_file(expr_ident.location.file),
+                                            expr_ident, *expr_ident.location,
+                                            expr_ident.name
+                                        );
+                                        if type_decls.count > 0 {
+                                            type_node = get_node_type(type_decls[0]);
+                                        }
+                                    } else {
+                                        type_node = get_node_type(decl.expression);
+                                    }
+                                }
+                            }
+
+                            if type_node {
+                                fields := get_type_fields(type_node);
+                                if fields.count > 0 {
+                                    dot_ok = true;
+                                    dot_fields = fields;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if cursor_node {
-        // We don't wanna to give completions inside strings.
-        if cursor_node.kind == .DIRECTIVE_STRING || (cursor_node.kind == Node.Kind.LITERAL && cursor_node.(*Literal).value_type == .STRING) {
-            lsp_respond(request.id, null);
-            return;
+        // Dot completion via node tree (for nodes that have valid parents)
+        if !dot_ok {
+            dot_ok, dot_fields = handle_dot_completitions(request, cursor_node, cursor_location);
         }
-
-        if cursor_node.kind == .DIRECTIVE_IMPORT {
-            handle_completitions_import(request, xx cursor_node);
-            return;
-        }
-
-        if cursor_node.kind == .DIRECTIVE_LOAD {
-            handle_completitions_load(request, file, xx cursor_node);
-            return;
-        }
-
-        dot_ok, dot_fields = handle_dot_completitions(request, cursor_node, cursor_location);
 
         if handle_assignment_completitions(request, cursor_node) {
             return;
@@ -63,9 +143,25 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     decls := get_declarations(file, cursor_node, *cursor_location);
 
     // Prepend type fields from dot completions (e.g. my_var. → fields first)
+    // Order: dot fields → basic keywords → general declarations
     if dot_ok && dot_fields.count > 0 {
+        // Convert basic keywords to Declaration wrappers and insert between
+        // dot fields and general declarations
+        keywords: [..]LSP_Completion_Item;
+        defer array_free(keywords);
+        add_basic_keywords(*keywords);
+        keyword_decls: [..]*Declaration;
+        defer array_free(keyword_decls);
+        for kw: keywords {
+            kd := New(Declaration);
+            kd.name = copy_string(kw.label);
+            kd.expression = *empty_identifier;
+            array_add(*keyword_decls, kd);
+        }
+
         combined: [..]*Declaration;
         array_add(*combined, .. dot_fields);
+        array_add(*combined, .. keyword_decls);
         array_add(*combined, .. decls);
         decls = combined;
     }
@@ -78,7 +174,7 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
         prefix = ident.name;
     }
 
-    send_completions_decls(request, decls, should_add_basic_keywords=true, file=file, prefix=prefix);
+    send_completions_decls(request, decls, should_add_basic_keywords=false, file=file, prefix=prefix);
 }
 handle_completitions_load :: (request: LSP_Request_Message_Completion, file: *Program_File, directive_load: *Directive_Load) {
     completions: [..]LSP_Completion_Item;
@@ -199,14 +295,93 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
     array_reverse(path);
 
     type := get_path_type(path);
-    if !type {
-        return false, empty;
+    if type {
+        fields := get_type_fields(type);
+        if fields.count > 0 {
+            return true, fields;
+        }
     }
 
-    fields := get_type_fields(type);
-    if fields.count > 0 {
-        return true, fields;
+    // Fallback: get_path_type returns the unresolved IDENTIFIER node itself
+    // when it can't find the declaration. Scan enclosing BLOCK for local
+    // variable declarations instead.
+    var_name: string;
+    if root_binary_op.left && root_binary_op.left.kind == .IDENTIFIER {
+        left_ident := cast(*Identifier) root_binary_op.left;
+        var_name = left_ident.name;
     }
+
+    if var_name.count > 0 {
+        current_node: *Node = root_binary_op;
+        block: *Block;
+        while current_node {
+            if current_node.kind == .BLOCK {
+                block = cast(*Block) current_node;
+                break;
+            }
+            current_node = current_node.parent;
+        }
+
+        if block {
+            for member, idx: block.members {
+                // Skip members that appear AFTER the cursor position
+                // NOTE: is_after is unreliable here (column check doesn't
+                // account for different lines). Use explicit line/col compare.
+                if member.location.l0 > cursor_location.l0 {
+                    continue;
+                }
+                if member.location.l0 == cursor_location.l0 && member.location.c0 > cursor_location.c0 {
+                    continue;
+                }
+
+                type_node: *Node;
+
+                if member.kind == .IDENTIFIER && member.(*Identifier).name == var_name {
+                    // Pattern 1: "Type var;" → two IDENTIFIERs in block
+                    if idx > 0 {
+                        prev := block.members[idx - 1];
+                        if prev.kind == .IDENTIFIER {
+                            prev_ident := cast(*Identifier) prev;
+                            type_decls := get_declarations(
+                                get_file(prev_ident.location.file),
+                                prev, *prev.location,
+                                prev_ident.name
+                            );
+                            if type_decls.count > 0 {
+                                type_node = get_node_type(type_decls[0]);
+                            }
+                        }
+                    }
+                } else if member.kind == .DECLARATION && member.(*Declaration).name == var_name {
+                    // Pattern 2: "var :: Type;" → DECLARATION node
+                    decl := cast(*Declaration) member;
+                    if decl.expression {
+                        if decl.expression.kind == .IDENTIFIER {
+                            expr_ident := cast(*Identifier) decl.expression;
+                            type_decls := get_declarations(
+                                get_file(expr_ident.location.file),
+                                expr_ident, *expr_ident.location,
+                                expr_ident.name
+                            );
+                            if type_decls.count > 0 {
+                                type_node = get_node_type(type_decls[0]);
+                            }
+                        } else {
+                            type_node = get_node_type(decl.expression);
+                        }
+                    }
+                }
+
+                if type_node {
+                    fields := get_type_fields(type_node);
+                    if fields.count > 0 {
+                        return true, fields;
+                    }
+                }
+            }
+        }
+    }
+
     return false, empty;
 }
 

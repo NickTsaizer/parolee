@@ -1259,13 +1259,25 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
             ident_decls := get_identifier_decls(ident);
 
             if ident_decls.count == 0 {
-                // log("Does not find anything for '%'...", ident.name);
                 return current_node;
             }
 
             current_node = select_decl(ident_decls, level);
 
             continue;
+        }
+
+        // Follow declaration to its type expression — resolves variables
+        // like `engine: Engine` to the struct definition.
+        if current_node.kind == .DECLARATION {
+            decl := cast(*Declaration) current_node;
+            if decl.type_inst {
+                current_node = decl.type_inst;  continue;
+            }
+            if decl.expression {
+                current_node = decl.expression;  continue;
+            }
+            break;
         }
 
         if current_node.kind == .STRUCT {
