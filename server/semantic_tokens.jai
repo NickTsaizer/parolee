@@ -226,12 +226,37 @@ emit_declaration_operator :: (node: *Node, entries: *[..]Token_Entry) {
     }
     if node.kind == .COMPOUND_DECLARATION {
         cd := cast(*Compound_Declaration) node;
-        // Place operator after the declaration name (cd.type_inst.name)
         if cd.type_inst {
-            op_col := cd.type_inst.location.c0 + cd.type_inst.name.count;
+            // Determine operator length from AST
             op_len := 1;
-            if cd.const { op_len = 2; }  // const :: — needs :: not just :
-            add_entry(xx cd.type_inst.location.l0, xx op_col, xx op_len, TOKEN_TYPE_OPERATOR, 0, entries);
+            if cd.const {
+                op_len = 2;  // ::
+            } else if !cd.type_inst.type_inst {
+                op_len = 2;  // :=
+            }
+            // Determine operator position from source text.
+            // cd.type_inst.location is zeroed (auto-generated Declaration),
+            // but cd.type_inst.expression / .type_inst have real parser locations.
+            rhs: *Node = cd.type_inst.type_inst;
+            if !rhs { rhs = cd.type_inst.expression; }
+            if rhs && rhs.location.c0 > 0 {
+                lsp_pos: LSP_Position;
+                lsp_pos.line = cast(u32) rhs.location.l0;
+                lsp_pos.character = 0;
+                line_text := find_line_in_memory_file(rhs.location.file, lsp_pos);
+                if line_text.count > 0 {
+                    search_from := rhs.location.c0 - 4;
+                    if search_from < 0 { search_from = 0; }
+                    search_to := rhs.location.c0;
+                    if search_to > line_text.count { search_to = line_text.count; }
+                    for i: search_from..search_to - 1 {
+                        if line_text[i] == #char ":" {
+                            add_entry(xx rhs.location.l0, xx i, xx op_len, TOKEN_TYPE_OPERATOR, 0, entries);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -391,6 +416,12 @@ classify_identifier :: (node: *Node, parent: *Node) -> u32, u32, bool {
         if parent.kind == .FOR {
             f := cast(*For) parent;
             if node == f.value || node == f.index || node == f.iterator {
+                return TOKEN_TYPE_VARIABLE, MODIFIER_DECLARATION, true;
+            }
+        }
+        if parent.kind == .COMPOUND_DECLARATION_ITEM {
+            item := cast(*Compound_Declaration_Item) parent;
+            if item.item_kind == .DECLARATION {
                 return TOKEN_TYPE_VARIABLE, MODIFIER_DECLARATION, true;
             }
         }

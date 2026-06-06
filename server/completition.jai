@@ -67,26 +67,9 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
                             }
 
                             type_node: *Node;
-                            if member.kind == .IDENTIFIER && member.(*Identifier).name == extract_dot_var_name {
-                                if idx > 0 {
-                                    prev := block.members[idx - 1];
-                                    if prev.kind == .IDENTIFIER {
-                                        prev_ident := cast(*Identifier) prev;
-                                        type_decls := get_declarations(
-                                            get_file(prev_ident.location.file),
-                                            prev, *prev.location,
-                                            prev_ident.name
-                                        );
-                                        if type_decls.count > 0 {
-                                            type_node = get_node_type(type_decls[0]);
-                                        }
-                                    }
-                                }
-                            } else if member.kind == .DECLARATION && member.(*Declaration).name == extract_dot_var_name {
+                            if member.kind == .DECLARATION && member.(*Declaration).name == extract_dot_var_name {
                                 decl := cast(*Declaration) member;
-                                // Handle "var: Type;" pattern (type_inst set)
                                 type_source: *Node = decl.type_inst;
-                                // Handle "var :: Type;" pattern (expression set)
                                 if !type_source { type_source = decl.expression; }
                                 if type_source {
                                     if type_source.kind == .IDENTIFIER {
@@ -103,6 +86,12 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
                                         type_node = get_node_type(type_source);
                                     }
                                 }
+                            } else if member.kind == .COMPOUND_DECLARATION {
+                                target_idx := resolve_compound_var_index(member, extract_dot_var_name);
+                                if target_idx >= 0 {
+                                    cd := cast(*Compound_Declaration) member;
+                                    type_node = resolve_compound_var_type(cd, target_idx);
+                                }
                             }
 
                             if type_node {
@@ -115,6 +104,11 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
                             }
                         }
                     }
+
+                    // Block scan missed it — scan all file nodes for the declaration.
+                    if !dot_ok {
+                        dot_ok, dot_fields = dot_completion_file_scan_fallback(file, cursor_location, extract_dot_var_name);
+                    }
                 }
             }
         }
@@ -124,6 +118,11 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
         // Dot completion via node tree (for nodes that have valid parents)
         if !dot_ok {
             dot_ok, dot_fields = handle_dot_completitions(request, cursor_node, cursor_location);
+        }
+
+        // If node-tree dot resolution failed, try file-node scan fallback
+        if !dot_ok {
+            dot_ok, dot_fields = dot_completion_file_scan_fallback(file, cursor_location);
         }
 
         if handle_assignment_completitions(request, cursor_node) {
@@ -321,25 +320,7 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
 
                 type_node: *Node;
 
-                if member.kind == .IDENTIFIER && member.(*Identifier).name == var_name {
-                    // Pattern 1: "Type var;" → two IDENTIFIERs in block
-                    if idx > 0 {
-                        prev := block.members[idx - 1];
-                        if prev.kind == .IDENTIFIER {
-                            prev_ident := cast(*Identifier) prev;
-                            type_decls := get_declarations(
-                                get_file(prev_ident.location.file),
-                                prev, *prev.location,
-                                prev_ident.name
-                            );
-                            if type_decls.count > 0 {
-                                type_node = get_node_type(type_decls[0]);
-                            }
-                        }
-                    }
-                } else if member.kind == .DECLARATION && member.(*Declaration).name == var_name {
-                    // Pattern 2: "var :: Type;" → DECLARATION node
-                    // Pattern 3: "var: Type;" → DECLARATION node (type_inst set)
+                if member.kind == .DECLARATION && member.(*Declaration).name == var_name {
                     decl := cast(*Declaration) member;
                     type_source: *Node = decl.type_inst;
                     if !type_source { type_source = decl.expression; }
@@ -357,6 +338,12 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
                         } else {
                             type_node = get_node_type(type_source);
                         }
+                    }
+                } else if member.kind == .COMPOUND_DECLARATION {
+                    target_idx := resolve_compound_var_index(member, var_name);
+                    if target_idx >= 0 {
+                        cd := cast(*Compound_Declaration) member;
+                        type_node = resolve_compound_var_type(cd, target_idx);
                     }
                 }
 
@@ -507,6 +494,110 @@ handle_assignment_completitions :: (request: LSP_Request_Message_Completion, cur
     }
 
     return handle_completitions_for_node(request, left_type);
+}
+
+// ── Compound declaration helpers ──────────────────────────────────────────
+
+// Scan file.nodes for a declaration matching the variable before a dot.
+// Used as fallback when block scan and node-tree dot resolution both fail.
+dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node.Location, var_name_hint: string = "") -> (bool, [..]*Declaration) {
+    empty: [..]*Declaration;
+
+    // Extract variable name from source text if not provided
+    var_name := var_name_hint;
+    if var_name.count == 0 {
+        lsp_pos: LSP_Position;
+        lsp_pos.line = cast(u32) cursor_location.l0;
+        lsp_pos.character = cast(u32) cursor_location.c0;
+        line_text := find_line_in_memory_file(file.path, lsp_pos);
+        if line_text.count > 0 {
+            // Determine where the variable name ends (before the dot)
+            dot_col: s32 = -1;
+            // Try: cursor is on the dot (var. → char = '.')
+            if cursor_location.c0 < line_text.count && line_text[cursor_location.c0] == #char "." {
+                dot_col = cast(s32) cursor_location.c0;
+            }
+            // Try: cursor is after the dot (var.fi → char before cursor = '.')
+            if dot_col < 0 && cursor_location.c0 > 0 && line_text[cursor_location.c0 - 1] == #char "." {
+                dot_col = cast(s32) cursor_location.c0 - 1;
+            }
+            if dot_col >= 0 {
+                var_start := dot_col - 1;
+                while var_start >= 0 && ((line_text[var_start] >= #char "a" && line_text[var_start] <= #char "z") || (line_text[var_start] >= #char "A" && line_text[var_start] <= #char "Z") || (line_text[var_start] >= #char "0" && line_text[var_start] <= #char "9") || line_text[var_start] == #char "_") {
+                    var_start -= 1;
+                }
+                start_i := var_start + 1;
+                var_len := dot_col - start_i;
+                if var_len > 0 {
+                    var_name = copy_string(to_string(*line_text[start_i], var_len));
+                }
+            }
+        }
+    }
+    if var_name.count == 0 return false, empty;
+
+    for node: file.nodes {
+        if node.kind == .DECLARATION && node.(*Declaration).name == var_name {
+            decl := cast(*Declaration) node;
+            type_source: *Node = decl.type_inst;
+            if !type_source { type_source = decl.expression; }
+            if type_source {
+                fields := get_type_fields(get_node_type(type_source));
+                if fields.count > 0 {
+                    return true, fields;
+                }
+            }
+        } else if node.kind == .COMPOUND_DECLARATION {
+            target_idx := resolve_compound_var_index(node, var_name);
+            if target_idx >= 0 {
+                cd := cast(*Compound_Declaration) node;
+                type_node := resolve_compound_var_type(cd, target_idx);
+                if type_node {
+                    fields := get_type_fields(type_node);
+                    if fields.count > 0 {
+                        return true, fields;
+                    }
+                }
+            }
+        }
+    }
+    return false, empty;
+}
+
+// Resolve var index in a,b,c := expr() compound declaration.
+resolve_compound_var_index :: (member: *Node, name: string) -> int {
+    if member.kind != .COMPOUND_DECLARATION return -1;
+    cd := cast(*Compound_Declaration) member;
+    for item, idx: cd.members {
+        if item.kind == .COMPOUND_DECLARATION_ITEM {
+            cdi := cast(*Compound_Declaration_Item) item;
+            if cdi.expression.kind == .IDENTIFIER {
+                if (cast(*Identifier) cdi.expression).name == name return idx;
+            }
+        }
+    }
+    return -1;
+}
+
+// Resolve type of the idx-th variable in a compound declaration.
+resolve_compound_var_type :: (cd: *Compound_Declaration, idx: int) -> *Node {
+    if !cd.type_inst || !cd.type_inst.expression return null;
+    expr := cd.type_inst.expression;
+    if expr.kind == .PROCEDURE_CALL {
+        proc_node := get_node_type(expr, stop_at_procedure=true);
+        if proc_node && proc_node.kind == .PROCEDURE {
+            proc := cast(*Procedure) proc_node;
+            if idx < proc.returns.count {
+                return get_node_type(proc.returns[idx].expression);
+            }
+        }
+    } else if expr.kind == .COMMA_SEPARATED_EXPRESSION {
+        cse := cast(*Comma_Separated_Expression) expr;
+        if idx < cse.members.count {
+            return get_node_type(cse.members[idx]);
+        }
+    }
+    return null;
 }
 
 // Collect type fields for a node without sending any response.
