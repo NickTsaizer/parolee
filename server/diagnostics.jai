@@ -23,8 +23,28 @@ reset_diagnostics :: () {
 // Creates synthetic Declaration nodes in server.inserted_fields for
 // #bake_arguments declarations whose instantiated struct name matches.
 
+decl_type_key :: (file: string, l0: int, c0: int, name: string) -> string {
+    // Ignore c0: compiler and parser column bases can differ.
+    return tprint("%|%|%", file, l0, name);
+}
+
+decl_type_key_fallback :: (file: string, name: string) -> string {
+    // Unsaved edits can shift local declarations after diagnostics. File+name
+    // fallback preserves exact type-id lookup for common single-decl cases.
+    return tprint("%|%", file, name);
+}
+
+store_decl_type_id :: (key_tmp: string, type_id: u64) {
+    key := copy_string(key_tmp);
+    entry, is_new := find_or_add(*server.decl_type_ids, key);
+    if !is_new free(key);
+    entry.* = type_id;
+}
+
 process_struct_dump :: (output: string) {
     MARKER :: "JAILS_DIAG_STRUCT|";
+    MARKER_ID :: "JAILS_DIAG_STRUCT_ID|";
+    MARKER_DECL :: "JAILS_DIAG_DECL_TYPE|";
 
     if output.count == 0 {
         return;
@@ -34,6 +54,48 @@ process_struct_dump :: (output: string) {
 
     found: s64;
     for line: lines {
+        id_marker_pos := find_index_from_left(line, MARKER_ID);
+        if id_marker_pos >= 0 {
+            data_part := slice(line, id_marker_pos, line.count - id_marker_pos);
+            parts := split(data_part, "|",, temp);
+            if parts.count >= 5 {
+                type_id, id_ok := parse_int(*parts[1], u64);
+                if id_ok {
+                    member_str := parts[4];
+                    member_names := split(member_str, ",",, temp);
+
+                    type_entry, _ := find_or_add(*server.inserted_fields_by_type_id, type_id);
+                    type_entry.allocator = context.default_allocator;
+                    for mname: member_names {
+                        if mname.count == 0 continue;
+                        sd := New(Declaration);
+                        sd.name = copy_string(mname);
+                        sd.const = true;
+                        sd.has_elsewhere = false;
+                        sd.type_inst = *empty_identifier;
+                        append_unique_completion_decl(type_entry, sd);
+                    }
+                }
+            }
+            continue;
+        }
+
+        decl_marker_pos := find_index_from_left(line, MARKER_DECL);
+        if decl_marker_pos >= 0 {
+            data_part := slice(line, decl_marker_pos, line.count - decl_marker_pos);
+            parts := split(data_part, "|",, temp);
+            if parts.count >= 6 {
+                l0, l_ok := parse_int(*parts[3], int);
+                c0, c_ok := parse_int(*parts[4], int);
+                type_id, id_ok := parse_int(*parts[5], u64);
+                if l_ok && c_ok && id_ok {
+                    store_decl_type_id(decl_type_key(parts[2], l0, c0, parts[1]), type_id);
+                    store_decl_type_id(decl_type_key_fallback(parts[2], parts[1]), type_id);
+                }
+            }
+            continue;
+        }
+
         marker_pos := find_index_from_left(line, MARKER);
         if marker_pos < 0 continue;
         found += 1;
@@ -49,31 +111,39 @@ process_struct_dump :: (output: string) {
         member_str := parts[3];
         member_names := split(member_str, ",",, temp);
 
-        // Find a #bake_arguments declaration whose name matches this struct
-        // (struct_name is e.g. "Packages(Jay_Render)" — match base name before "(")
+        // Name-keyed cache for compiler-known struct fields. This covers
+        // #insert expansions even when we cannot reliably map the dump back
+        // to the exact source Declaration pointer.
         base_end := find_index_from_left(struct_name, "(");
         decl_name := struct_name;
         if base_end > 0 {
             decl_name = slice(struct_name, 0, base_end);
         }
 
-        // Name-keyed cache for compiler-known struct fields. This covers
-        // #insert expansions even when we cannot reliably map the dump back
-        // to the exact source Declaration pointer.
-        by_name_ok, _ := table_find(*server.inserted_fields_by_name, decl_name);
-        if !by_name_ok {
-            members_by_name: [..]*Declaration;
-            members_by_name.allocator = context.default_allocator;
-            for mname: member_names {
-                if mname.count == 0 continue;
-                sd := New(Declaration);
-                sd.name = copy_string(mname);
-                sd.const = true;
-                sd.has_elsewhere = false;
-                sd.type_inst = *empty_identifier;
-                array_add(*members_by_name, sd);
-            }
-            table_add(*server.inserted_fields_by_name, copy_string(decl_name), members_by_name);
+        // Accumulate ALL dump entries — polymorphic instantiations of the same
+        // struct (e.g. Test_Type("hello") and Test_Type("world")) produce
+        // separate JAILS_DIAG_STRUCT lines with the same name but different
+        // member sets. Appending keeps all of them; filtering at lookup time
+        // selects the right set using the type-instantiation arguments.
+        //
+        // Use a heap-allocated copy of decl_name for the table key so that
+        // harvest_build_symbols can safely free(name) in the next cycle. If
+        // the entry already exists, free the unused copy immediately.
+        name_key := copy_string(decl_name);
+        struct_entry, entry_is_new := find_or_add(*server.inserted_fields_by_name, name_key);
+        if entry_is_new {
+            struct_entry.allocator = context.default_allocator;
+        } else {
+            free(name_key);
+        }
+        for mname: member_names {
+            if mname.count == 0 continue;
+            sd := New(Declaration);
+            sd.name = copy_string(mname);
+            sd.const = true;
+            sd.has_elsewhere = false;
+            sd.type_inst = *empty_identifier;
+            append_unique_completion_decl(struct_entry, sd);
         }
 
         for file: server.files {
@@ -95,21 +165,19 @@ process_struct_dump :: (output: string) {
 
                 // Found matching declaration — add synthetic declarations
                 lock(*file.mutex);
-                // Skip if already processed (stdout and stderr may both have this)
-                ok, _ := table_find(*server.inserted_fields, nd);
-                    if !ok {
-                        members: [..]*Declaration;
-                        members.allocator = context.default_allocator;
-                        for mname: member_names {
-                            sd := New(Declaration);
-                            sd.name = copy_string(mname);
-                            sd.const = true;
-                            sd.has_elsewhere = false;
-                            sd.type_inst = *empty_identifier;
-                            array_add(*members, sd);
-                        }
-                        table_add(*server.inserted_fields, nd, members);
-                    }
+                ptr_entry, ptr_is_new := find_or_add(*server.inserted_fields, nd);
+                if ptr_is_new {
+                    ptr_entry.allocator = context.default_allocator;
+                }
+                for mname: member_names {
+                    if mname.count == 0 continue;
+                    sd := New(Declaration);
+                    sd.name = copy_string(mname);
+                    sd.const = true;
+                    sd.has_elsewhere = false;
+                    sd.type_inst = *empty_identifier;
+                    append_unique_completion_decl(ptr_entry, sd);
+                }
                 unlock(*file.mutex);
                 break;
             }

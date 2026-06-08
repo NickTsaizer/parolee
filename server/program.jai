@@ -87,6 +87,18 @@ deinit_inserted_fields :: () {
     }
 
     deinit(*server.inserted_fields_by_name);
+
+    for members: server.inserted_fields_by_type_id {
+        array_free(members);
+    }
+
+    deinit(*server.inserted_fields_by_type_id);
+
+    for _, key: server.decl_type_ids {
+        if key.count > 0 free(key);
+    }
+
+    deinit(*server.decl_type_ids);
 }
 
 reset_file :: (using file: Program_File) {
@@ -2395,6 +2407,16 @@ harvest_build_symbols :: () {
         if name.count > 0 free(name);
     }
     table_reset(*server.inserted_fields_by_name);
+
+    for members: server.inserted_fields_by_type_id {
+        array_free(members);
+    }
+    table_reset(*server.inserted_fields_by_type_id);
+
+    for _, key: server.decl_type_ids {
+        if key.count > 0 free(key);
+    }
+    table_reset(*server.decl_type_ids);
 
     build_files := file_list(build_dir, false,, temp);
 

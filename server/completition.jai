@@ -118,6 +118,13 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     }
 
     if cursor_node {
+        // Prefer source-text receiver scan before node-tree dot resolution.
+        // Node-tree resolution can choose the type declaration (Type.) rather
+        // than the instance declaration (v.) when cursor sits at dot boundary.
+        if !dot_ok {
+            dot_ok, dot_fields = dot_completion_file_scan_fallback(file, cursor_location);
+        }
+
         // Dot completion via node tree (for nodes that have valid parents)
         if !dot_ok {
             dot_ok, dot_fields = handle_dot_completitions(request, cursor_node, cursor_location);
@@ -623,7 +630,16 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
             type_source: *Node = decl.type_inst;
             if !type_source { type_source = decl.expression; }
             if type_source {
-                fields := get_type_fields(get_node_type(type_source));
+                // Pass PROCEDURE_CALL directly so polymorphic args are
+                // available for per-instantiation #insert field filtering.
+                node_to_resolve := type_source;
+                if type_source.kind == .PROCEDURE_CALL {
+                    node_to_resolve = type_source;
+                } else {
+                    node_to_resolve = get_node_type(type_source);
+                }
+                fields := get_type_fields(node_to_resolve);
+                append_inserted_fields_for_decl_exact(*fields, decl);
                 if fields.count > 0 {
                     return true, fields;
                 }
@@ -664,7 +680,18 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                 type_source = cast(*Node) cd.type_inst;
             }
             if type_source {
-                fields := get_type_fields(get_node_type(type_source));
+                // Pass PROCEDURE_CALL directly so polymorphic args are
+                // available for per-instantiation #insert field filtering.
+                node_to_resolve := type_source;
+                if type_source.kind == .PROCEDURE_CALL {
+                    node_to_resolve = type_source;
+                } else {
+                    node_to_resolve = get_node_type(type_source);
+                }
+                fields := get_type_fields(node_to_resolve);
+                if local_decl.kind == .DECLARATION {
+                    append_inserted_fields_for_decl_exact(*fields, cast(*Declaration) local_decl);
+                }
                 if fields.count > 0 {
                     return true, fields;
                 }
@@ -872,6 +899,34 @@ append_unique_completion_decl :: (decls: *[..]*Declaration, decl: *Declaration) 
     array_add(decls, decl);
 }
 
+get_decl_type_id :: (decl: *Declaration) -> u64, bool {
+    if !decl return 0, false;
+    key := decl_type_key(decl.location.file, decl.location.l0, decl.location.c0, decl.name);
+    ok, type_id := table_find(*server.decl_type_ids, key);
+    if ok return type_id, true;
+    fallback_key := decl_type_key_fallback(decl.location.file, decl.name);
+    ok, type_id = table_find(*server.decl_type_ids, fallback_key);
+    if ok return type_id, true;
+    return 0, false;
+}
+
+append_inserted_fields_for_type_id :: (decls: *[..]*Declaration, type_id: u64) -> bool {
+    if type_id == 0 return false;
+    ok, inserted := table_find(*server.inserted_fields_by_type_id, type_id);
+    if !ok return false;
+
+    for field: inserted {
+        append_unique_completion_decl(decls, field);
+    }
+    return true;
+}
+
+append_inserted_fields_for_decl_exact :: (decls: *[..]*Declaration, decl: *Declaration) -> bool {
+    type_id, ok := get_decl_type_id(decl);
+    if !ok return false;
+    return append_inserted_fields_for_type_id(decls, type_id);
+}
+
 append_inserted_fields_for_name :: (decls: *[..]*Declaration, name: string) -> bool {
     found: bool;
     ok, inserted_by_name := table_find(*server.inserted_fields_by_name, name);
@@ -927,7 +982,85 @@ append_inserted_fields_for_bake_decl_name :: (decls: *[..]*Declaration, name: st
     return false;
 }
 
+// ── Harvested field filtering for polymorphic instantiation ────────────────
+
+// Check if a harvested field name matches a type-instantiation argument.
+// Handles the common `sprint("%, %_2, ...", param, ...)` pattern where
+// generated field names equal the argument value or have an `_N` suffix:
+//   Test_Type("hello") → fields "hello", "hello_2", "hello_3"
+harvested_field_matches_arg :: (name: string, arg: *Node) -> bool {
+    if !arg || arg.kind != .LITERAL return false;
+    lit := cast(*Literal) arg;
+    if lit.value_type != .STRING return false;
+    arg_val := lit._string;
+    if arg_val.count == 0 return false;
+    // Exact match: "hello" == "hello"
+    if name == arg_val return true;
+    // Prefix match: "hello_2" starts with "hello_"
+    if name.count > arg_val.count
+        && find_index_from_left(name, arg_val) == 0
+        && name[arg_val.count] == #char "_"
+    {
+        return true;
+    }
+    return false;
+}
+
+harvested_field_matches_any_arg :: (name: string, args: []*Node) -> bool {
+    for arg: args {
+        if harvested_field_matches_arg(name, arg) return true;
+    }
+    return false;
+}
+
+// Like append_inserted_fields_for_decl but filters harvested fields to only
+// include those whose names match the given type-instantiation arguments.
+// Handles the common `sprint("%, %_2, ...", param, ...)` pattern where
+// generated field names equal string-literal argument values.
+// When no args match (non-string args or no args), falls back to unfiltered
+// to avoid hiding all harvested fields from non-string-arg instantiations.
+append_inserted_fields_filtered :: (decls: *[..]*Declaration, decl: *Declaration, filter_args: []*Node) {
+    ok, inserted := table_find(*server.inserted_fields, decl);
+    if !ok {
+        // Fall back to name-keyed cache, also with filtering
+        ok, inserted_by_name := table_find(*server.inserted_fields_by_name, decl.name);
+        if ok {
+            had_match: bool;
+            for field: inserted_by_name {
+                if harvested_field_matches_any_arg(field.name, filter_args) {
+                    append_unique_completion_decl(decls, field);
+                    had_match = true;
+                }
+            }
+            if !had_match {
+                // No field matched the filter args. Could be a non-string-arg
+                // instantiation (e.g. Vec4 :: Vector(4) where arg is integer).
+                // Add all fields to avoid hiding harvested completions.
+                for field: inserted_by_name {
+                    append_unique_completion_decl(decls, field);
+                }
+            }
+        }
+        return;
+    }
+    had_match: bool;
+    for field: inserted {
+        if harvested_field_matches_any_arg(field.name, filter_args) {
+            append_unique_completion_decl(decls, field);
+            had_match = true;
+        }
+    }
+    if !had_match {
+        // Fallback: add all when filter matched nothing
+        for field: inserted {
+            append_unique_completion_decl(decls, field);
+        }
+    }
+}
+
 append_inserted_fields_for_decl :: (decls: *[..]*Declaration, decl: *Declaration, label: string = "") {
+    if append_inserted_fields_for_decl_exact(decls, decl) return;
+
     ok, inserted := table_find(*server.inserted_fields, decl);
     if !ok {
         // Declarations can be re-parsed between diagnostics harvest and
@@ -990,10 +1123,12 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
             }
 
             // Add compiler-harvested #insert fields
+            // NOTE: STRUCT case is hit from get_node_type which loses type
+            // args, so no filtering here. Callers that have type args should
+            // pass PROCEDURE_CALL directly to get_type_fields instead.
             if node.parent && node.parent.kind == .DECLARATION {
                 parent_decl := cast(*Declaration) node.parent;
-                append_inserted_fields_for_decl(*decls, parent_decl, "struct-case");
-
+                append_inserted_fields_for_decl_exact(*decls, parent_decl);
             }
         case .TYPE_INSTANTIATION;
             ti := cast(*Type_Instantiation) node;
@@ -1012,11 +1147,22 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
                         if ok append_unique_completion_decl(*type_decls, local_decl);
                     }
                 }
+                // Collect type-instantiation arguments for #insert field filtering
+                ti_args: [..]*Node;
+                if ti.expression && ti.expression.kind == .PROCEDURE_CALL {
+                    ti_pc := cast(*Procedure_Call) ti.expression;
+                    array_add(*ti_args, .. ti_pc.arguments);
+                }
+
                 for d: type_decls {
                     _struct := find_struct_of_expression(d.expression);
                     if _struct {
                         add_all_fields_of(*decls, _struct);
-                        append_inserted_fields_for_decl(*decls, d, "ti-struct");
+                        if ti_args.count > 0 {
+                            append_inserted_fields_filtered(*decls, d, ti_args);
+                        } else {
+                            append_inserted_fields_for_decl(*decls, d, "ti-struct");
+                        }
 
                         if _struct.polymorphic_arguments.count > 0 {
                             for arg, arg_i: _struct.polymorphic_arguments {
@@ -1026,11 +1172,8 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
                                     synth_decl.name = param_name;
                                     synth_decl.const = false;
                                     synth_decl.has_elsewhere = false;
-                                    if ti.expression && ti.expression.kind == .PROCEDURE_CALL {
-                                        proc_call := cast(*Procedure_Call) ti.expression;
-                                        if arg_i < proc_call.arguments.count {
-                                            synth_decl.type_inst = proc_call.arguments[arg_i];
-                                        }
+                                    if arg_i < ti_args.count {
+                                        synth_decl.type_inst = ti_args[arg_i];
                                     }
                                     append_unique_completion_decl(*decls, synth_decl);
                                 }
@@ -1067,7 +1210,7 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
                     _struct := find_struct_of_expression(d.expression);
                     if _struct {
                         add_all_fields_of(*decls, _struct);
-                        append_inserted_fields_for_decl(*decls, d, "proc-call-struct");
+                        append_inserted_fields_filtered(*decls, d, proc_call.arguments);
 
                         if _struct.polymorphic_arguments.count > 0 {
                             for arg, arg_i: _struct.polymorphic_arguments {
@@ -1087,13 +1230,24 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
                             }
                         }
                     } else {
-                        append_inserted_fields_for_decl(*decls, d, "proc-call-else");
+                        append_inserted_fields_filtered(*decls, d, proc_call.arguments);
                     }
                 }
 
                 if decls.count == 0 {
                     if !append_inserted_fields_for_name(*decls, ident.name) {
-                        append_inserted_fields_for_bake_decl_name(*decls, ident.name);
+                        // For polymorphic instantiations, also filter name-based fallback
+                        ok, by_name_fields := table_find(*server.inserted_fields_by_name, ident.name);
+                        if ok && proc_call.arguments.count > 0 {
+                            for field: by_name_fields {
+                                if harvested_field_matches_any_arg(field.name, proc_call.arguments) {
+                                    append_unique_completion_decl(*decls, field);
+                                }
+                            }
+                        }
+                        if decls.count == 0 {
+                            append_inserted_fields_for_bake_decl_name(*decls, ident.name);
+                        }
                     }
                 }
             }

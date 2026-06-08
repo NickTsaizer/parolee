@@ -48,6 +48,37 @@ init :: (p: *Plugin, options: [] string) -> bool {
 // Output goes through compiler_report(.INFO) — captured by the LSP from stderr.
 // Format: JAILS_DIAG_STRUCT|type_name|member_count|member1,member2,...
 
+emit_decl_type :: (decl: *Code_Declaration) {
+    if !decl return;
+
+    type_id: u64;
+    if decl.type {
+        type_id = cast(u64) decl.type;
+    }
+    if decl.type_inst && decl.type_inst.result {
+        type_id = cast(u64) decl.type_inst.result;
+    }
+    if decl.expression {
+        if decl.expression.kind == .PROCEDURE_CALL {
+            call := cast(*Code_Procedure_Call) decl.expression;
+            if call.resolved_procedure_expression && call.resolved_procedure_expression.kind == .STRUCT {
+                st := cast(*Code_Struct) call.resolved_procedure_expression;
+                if st.defined_type type_id = cast(u64) st.defined_type;
+            }
+        } else if decl.expression.kind == .STRUCT {
+            st := cast(*Code_Struct) decl.expression;
+            if st.defined_type type_id = cast(u64) st.defined_type;
+        } else if decl.expression.type {
+            type_id = cast(u64) decl.expression.type;
+        }
+    }
+    if type_id == 0 return;
+
+    file := "";
+    if decl.enclosing_load file = decl.enclosing_load.fully_pathed_filename;
+    print("JAILS_DIAG_DECL_TYPE|%|%|%|%|%\n", decl.name, file, decl.l0, decl.c0, type_id);
+}
+
 message :: (_p: *Plugin, msg: *Message) {
     if msg.kind != .TYPECHECKED return;
 
@@ -75,7 +106,22 @@ message :: (_p: *Plugin, msg: *Message) {
         // Report via print — captured by LSP's run_command stdout/stderr.
         // compiler_report(.INFO) is suppressed by -quiet, so use print instead.
         print("JAILS_DIAG_STRUCT|%|%|%\n", si.name, si.members.count, member_str);
+        print("JAILS_DIAG_STRUCT_ID|%|%|%|%\n", cast(u64) si, si.name, si.members.count, member_str);
         p.seen_types += 1;
+    }
+
+    // Map source declarations to compiler type ids. This bridges parser AST nodes
+    // to Type_Info ids emitted above using file+location+name.
+    for d: tc.declarations {
+        emit_decl_type(d.expression);
+    }
+
+    for pb: tc.procedure_bodies {
+        for node: pb.subexpressions {
+            if node.kind == .DECLARATION {
+                emit_decl_type(cast(*Code_Declaration) node);
+            }
+        }
     }
 }
 

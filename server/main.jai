@@ -89,6 +89,8 @@ Server :: struct {
     // Cleared and rebuilt each harvest cycle (intermediate file AST pool changes).
     inserted_fields: Table(*Declaration, [..]*Declaration);
     inserted_fields_by_name: Table(string, [..]*Declaration);
+    inserted_fields_by_type_id: Table(u64, [..]*Declaration);
+    decl_type_ids: Table(string, u64);
 }
 
 server: Server;
