@@ -83,6 +83,12 @@ Server :: struct {
     analysis_index: int = -1;     // index into files_to_be_analyzed, -1 = not started
     preload_file: *Program_File;  // cached preload file (found once per batch)
     runtime_support_file: *Program_File; // cached runtime support file (found once per batch)
+
+    // Harvested fields from #bake_arguments / #insert expansions
+    // Maps source Declaration -> generated member Declarations from .added_strings files
+    // Cleared and rebuilt each harvest cycle (intermediate file AST pool changes).
+    inserted_fields: Table(*Declaration, [..]*Declaration);
+    inserted_fields_by_name: Table(string, [..]*Declaration);
 }
 
 server: Server;
@@ -434,8 +440,9 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             parse_file(file_path, true, true);
             server.needs_reanalyze = false;
 
-            // Defer analyze_files until background import resolution completes
-            // (skips expensive get_file_links scan — re-runs in main loop anyway)
+            // Run diagnostics after initial indexing so compiler-harvested
+            // #insert/#bake_arguments completions are available without an
+            // initial manual save. Scheduler waits for import workers to idle.
             server.diagnostics_pending = true;
 
             log("File_path: %", file_path);
@@ -676,7 +683,10 @@ worker_proc :: (thread: *Thread) -> s64 {
         // Execute
         if task.type == .parse_import {
             parse_file(task.file_path, false, task.shallow, false); // imported → restrict transitive
+            if task.file_path.count > 0 free(task.file_path);
         }
+
+        reset_temporary_storage();
 
         // Signal completion — main thread polls done_pipe_r
         sig = 0;
@@ -840,6 +850,11 @@ POLL_IDLE_MS :: 20;  // ms — idle wait before background work. poll() returns 
 main :: () {
     context.logger = lsp_log;
 
+    #if MEMORY_DEBUG defer {
+        context.logger = runtime_support_default_logger;
+        report_memory_leaks();
+    }
+
     success: bool;
     success, server.args = parse_arguments(Args);
     if !success {
@@ -858,8 +873,6 @@ main :: () {
     }
 
     log("Args are %", server.args);
-
-    defer deinit(*server.files);
 
     server.files_to_be_analyzed.allocator = context.default_allocator;
 
@@ -892,20 +905,46 @@ main :: () {
         #if OS != .WINDOWS {
             sig: u8 = 0;
             write(cast(s32) server.io_signal_w, *sig, 1);
-            write(cast(s32) server.task_signal_w, *sig, 1);  // wake workers
+            for server.worker_threads {
+                write(cast(s32) server.task_signal_w, *sig, 1);  // wake workers
+            }
             close(0);
         }
         thread_deinit(*server.io_thread);
-        for server.worker_threads { thread_deinit(it); }
+        for server.worker_threads {
+            thread_deinit(it);
+            free(it);
+        }
         array_free(server.worker_threads);
 
         deinit_memory_files();
+        deinit_inserted_fields();
+        deinit_server_files();
+
+        for path: server.deferred_imports {
+            free(path);
+        }
+        array_free(server.deferred_imports);
+
+        for task: server.task_queue {
+            if task.file_path.count > 0 free(task.file_path);
+        }
+        array_free(server.task_queue);
+
         destroy(*server.files_mutex);
         destroy(*server.deferred_mutex);
         destroy(*server.io_queue_mutex);
         destroy(*server.task_queue_mutex);
         destroy(*server.output_queue_mutex);
+
+        for msg: server.output_queue {
+            free(msg);
+        }
         array_free(server.output_queue);
+
+        for body: server.io_queue {
+            free(body);
+        }
         array_free(server.io_queue);
         #if OS != .WINDOWS {
             close(server.io_signal_r); close(server.io_signal_w);
@@ -981,14 +1020,17 @@ main :: () {
             }
         }
 
-        #if MEMORY_DEBUG report_memory_leaks();
     }
 
     // Flush any remaining output before exit — ensures shutdown response is sent
     flush_output_queue();
     // Don't call log() here — it would add to output_queue without flushing,
     // and the temp-allocated string data could be corrupted on exit.
-    exit(0);
+    #if MEMORY_DEBUG {
+        return;
+    } else {
+        exit(0);
+    }
 }
 
 #import "Compiler";
@@ -1030,5 +1072,3 @@ main :: () {
 } else {
     #import "POSIX";
 }
-
-

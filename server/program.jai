@@ -57,8 +57,36 @@ deinit_file :: (using file: Program_File) {
     array_free(nodes);
     array_free(loads);
     array_free(imports);
+    array_free(comments);
     release(*file.ast_pool);
     release(*file.analysis_pool);
+}
+
+deinit_server_files :: () {
+    for file: server.files {
+        if !file continue;
+        deinit_file(file.*);
+        if file.path.count > 0 free(file.path);
+        free(file);
+    }
+
+    deinit(*server.files);
+    array_free(server.files_to_be_analyzed);
+}
+
+deinit_inserted_fields :: () {
+    for members: server.inserted_fields {
+        array_free(members);
+    }
+
+    deinit(*server.inserted_fields);
+
+    for members, name: server.inserted_fields_by_name {
+        array_free(members);
+        if name.count > 0 free(name);
+    }
+
+    deinit(*server.inserted_fields_by_name);
 }
 
 reset_file :: (using file: Program_File) {
@@ -118,7 +146,10 @@ normalize_and_copy_path :: (path: string) -> string {
         return "";
     }
 
+    saved_allocator := context.allocator;
+    context.allocator = temp;
     str := normalize_path(path);
+    context.allocator = saved_allocator;
     return copy_string(str);
 }
 
@@ -152,7 +183,10 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
     server.follow_all_imports = follow_all;
     defer server.follow_all_imports = saved_follow_all;
 
+    saved_allocator_for_path := context.allocator;
+    context.allocator = temp;
     path := normalize_path(input_path);
+    context.allocator = saved_allocator_for_path;
 
     // Thread-safe find-or-create: protect server.files lookup + add with mutex
     lock(*server.files_mutex);
@@ -227,18 +261,16 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
     array_add_if_unique(*server.files_to_be_analyzed, file);
 
     // We must revalidate all files that are using this file in some way.
-    if !server.skip_reanalyze {
-        files_using_this_file := get_files_that_use(file,, temp);
-        for file_using_this_file: files_using_this_file {
-            array_add_if_unique(*server.files_to_be_analyzed, file_using_this_file);
-        }
-    }
+    // get_files_that_use DISABLED — temp allocator crashes in is_avaiable_from_impl
+    // during recursive import traversal for large projects.
+    // Scheduler loop handles incremental re-analysis per-file anyway.
 
     // Seed linked_files with Preload + Runtime_Support immediately so
     // completions have access to their declarations even before background
     // analysis runs (which overwrites linked_files with the full set).
     if file.linked_files.count == 0 {
         linked: [..]Linked_File;
+        linked.allocator = pool_alloc(*file.analysis_pool);
         for f: server.files {
             if f == file continue;
             preload_or_runtime: bool;
@@ -1313,6 +1345,16 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
             }
         }
 
+        if current_node.kind == .TYPE_INSTANTIATION {
+            ti := cast(*Type_Instantiation) current_node;
+            if ti.expression {
+                current_node = ti.expression;
+                continue;
+            }
+
+            break;
+        }
+
         if current_node.kind == .LITERAL {
             literal := cast(*Literal) current_node;
 
@@ -1413,7 +1455,7 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
 
         if current_node.kind == .DIRECTIVE_BAKE_ARGUMENTS {
             directive_bake_arguments := cast(*Directive_Bake_Arguments) current_node;
-            if directive_bake_arguments.expression && directive_bake_arguments.expression.kind == .PROCEDURE {
+            if directive_bake_arguments.expression {
                 current_node = directive_bake_arguments.expression;
                 continue;
             }
@@ -1462,6 +1504,64 @@ unwrap_polymorphic_constant :: (node: *Node) -> *Node {
     return const.expression;
 }
 
+// Extract name from a polymorphic parameter node.
+// $packages: Type → Polymorphic_Constant(expression=Declaration(name="packages"))
+// $T            → Polymorphic_Constant(expression=Identifier(name="T"))
+get_polymorphic_param_name :: (arg: *Node) -> string {
+    // Polymorphic args in a struct definition (declared as `struct (x: Type)`)
+    // are stored as DECLARATION nodes.
+    if arg.kind == .DECLARATION {
+        decl := cast(*Declaration) arg;
+        return decl.name;
+    }
+
+    if arg.kind != .POLYMORPHIC_CONSTANT return "";
+    pc := cast(*Polymorphic_Constant) arg;
+    if !pc.expression return "";
+    if pc.expression.kind == .IDENTIFIER {
+        ident := cast(*Identifier) pc.expression;
+        return ident.name;
+    }
+    if pc.expression.kind == .DECLARATION {
+        decl := cast(*Declaration) pc.expression;
+        return decl.name;
+    }
+    return "";
+}
+
+// Given a Declaration's expression node, resolve through wrappers to find
+// the underlying Struct, if any.
+// Does NOT follow #bake_arguments — that calls arbitrary compile-time code
+// (e.g. Mixer) and generates a NEW struct whose fields are opaque to static
+// analysis. The template struct's fields are wrong and misleading.
+find_struct_of_expression :: (expr: *Node) -> *Struct {
+    if !expr return null;
+
+    if expr.kind == .STRUCT {
+        return cast(*Struct) expr;
+    }
+
+    if expr.kind == .DIRECTIVE_TYPE {
+        dt := cast(*Directive_Type) expr;
+        return find_struct_of_expression(dt.expression);
+    }
+
+    if expr.kind == .TYPE_INSTANTIATION {
+        ti := cast(*Type_Instantiation) expr;
+        return find_struct_of_expression(ti.expression);
+    }
+
+    if expr.kind == .PROCEDURE_CALL {
+        resolved := get_node_type(expr);
+        if resolved && resolved.kind == .STRUCT {
+            return cast(*Struct) resolved;
+        }
+    }
+
+    return null;
+}
+
+
 unwrap_pointer :: (unary_op: *Unary_Operation) -> *Node {
     if unary_op.operation != .POINTER return unary_op;
 
@@ -1480,6 +1580,18 @@ get_block_of :: (node: *Node) -> *Block {
         case .STRUCT; return (cast(*Struct) node).block;
         case .ENUM;   return (cast(*Enum) node).block;
         case .UNION;  return (cast(*Union) node).block;
+        case .PROCEDURE_CALL; {
+            pc := cast(*Procedure_Call) node;
+            if pc.procedure && pc.procedure.kind == .IDENTIFIER {
+                pc_decls := get_identifier_decls(cast(*Identifier) pc.procedure);
+                for d: pc_decls {
+                    if d.expression && d.expression.kind == .STRUCT {
+                        return (cast(*Struct) d.expression).block;
+                    }
+                }
+            }
+            return null;
+        }
     }
 
     return null;
@@ -1561,6 +1673,50 @@ get_members_in :: (parent: *Node, ident: *Identifier) -> []*Declaration {
         if internal_string_struct {
             parent = internal_string_struct;
         }
+    }
+
+    // Polymorphic struct instantiation: resolve Procedure_Call → Struct
+    if parent.kind == .PROCEDURE_CALL {
+        proc_call := cast(*Procedure_Call) parent;
+        if proc_call.procedure && proc_call.procedure.kind == .IDENTIFIER {
+            pc_decls := get_identifier_decls(cast(*Identifier) proc_call.procedure);
+            for d: pc_decls {
+                _struct := find_struct_of_expression(d.expression);
+                if !_struct continue;
+
+                // Check block members first
+                if _struct.block {
+                    block_member := get_block_member(_struct.block, ident);
+                    if block_member {
+                        array_add(*decls, block_member);
+                    }
+                }
+
+                // Check polymorphic parameters — these become implicit fields
+                // (e.g. struct($packages: Type) creates a `packages` field)
+                if _struct.polymorphic_arguments.count > 0 {
+                    for arg, arg_i: _struct.polymorphic_arguments {
+                        param_name := get_polymorphic_param_name(arg);
+                        if param_name.count > 0 && ident && ident.name == param_name {
+                            // Create synthetic declaration for the polymorphic field
+                            synth_decl := New(Declaration);
+                            synth_decl.name = param_name;
+                            synth_decl.const = false;
+                            synth_decl.has_elsewhere = false;
+                            // The corresponding argument in proc_call is the instantiated type
+                            if arg_i < proc_call.arguments.count {
+                                synth_decl.type_inst = proc_call.arguments[arg_i];
+                            }
+                            synth_decl.expression = d.expression;
+                            array_add(*decls, synth_decl);
+                        }
+                    }
+                }
+
+                break;
+            }
+        }
+        return decls;
     }
 
     block := get_block_of(parent);
@@ -1789,7 +1945,23 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 1024) -> *Node {
                         return null;
                     }
 
-                    current_type = get_node_type(identifier, solve_array, select_first_non_procedure_decl);
+                    ident_decls := get_identifier_decls(identifier);
+                    selected_decl := select_first_non_procedure_decl(ident_decls, 0);
+                    if selected_decl && selected_decl.type_inst {
+                        if selected_decl.type_inst.kind == .TYPE_INSTANTIATION {
+                            ti := cast(*Type_Instantiation) selected_decl.type_inst;
+                            if ti.expression {
+                                current_type = ti.expression;
+                            }
+                        } else if selected_decl.type_inst.kind == .PROCEDURE_CALL {
+                            current_type = selected_decl.type_inst;
+                        }
+                    }
+
+                    if !current_type {
+                        current_type = get_node_type(identifier, solve_array, select_first_non_procedure_decl);
+                    }
+
                     if !current_type {
                         break;
                     }
@@ -1815,15 +1987,61 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 1024) -> *Node {
                         break;
                     }
 
-                    type := get_block_member_type(_struct.block, identifier, solve_array);
-                    if !type {
+                    member_type := get_block_member_type(_struct.block, identifier, solve_array);
+                    if !member_type {
                         // log_error("Failed to get member type for %", identifier.name);
                         break;
                     }
 
-                    current_type = type;
+                    current_type = member_type;
                     resolved_nodes += 1;
                     continue;
+                }
+
+                // Polymorphic struct instantiation: type is a Procedure_Call
+                // wrapping a struct with polymorphic_arguments. Route member
+                // lookup through the struct's block.
+                if current_type.kind == .PROCEDURE_CALL {
+                    pc := cast(*Procedure_Call) current_type;
+                    if pc.procedure && pc.procedure.kind == .IDENTIFIER {
+                        pc_decls := get_identifier_decls(cast(*Identifier) pc.procedure);
+                        pc_found: bool;
+                        for d: pc_decls {
+                            _struct := find_struct_of_expression(d.expression);
+                            if _struct {
+
+                                // Check block members first
+                                if _struct.block {
+                                    member_type := get_block_member_type(_struct.block, identifier, solve_array);
+                                    if member_type {
+                                        current_type = member_type;
+                                        resolved_nodes += 1;
+                                        pc_found = true;
+                                        break;
+                                    }
+                                }
+
+                                // Check polymorphic parameters — these become implicit fields
+                                // (e.g. struct($packages: Type) creates `packages`)
+                                if !pc_found && _struct.polymorphic_arguments.count > 0 {
+                                    for arg, arg_i: _struct.polymorphic_arguments {
+                                        param_name := get_polymorphic_param_name(arg);
+                                        if param_name.count > 0 && identifier.name == param_name {
+                                            // Resolve to the corresponding instantiated type
+                                            if arg_i < pc.arguments.count {
+                                                current_type = pc.arguments[arg_i];
+                                                resolved_nodes += 1;
+                                                pc_found = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if pc_found continue;
+                    }
+                    break;
                 }
 
             case .LITERAL;
@@ -1869,7 +2087,10 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 1024) -> *Node {
     }
 
     if current_type && current_type.kind == .IDENTIFIER && current_type.location.file.data != null {
-        return get_path_type(.[current_type], recursion_limit - 1);
+        resolved := get_node_type(current_type);
+        if resolved && resolved != current_type {
+            return resolved;
+        }
     }
 
     // We are unable to resolve whole path so the final type would be invalid.
@@ -2108,5 +2329,170 @@ compound_declaration_to_declarations :: (decls: *[..]*Declaration, comp_decl: *C
         decl.expression = item_expr;
 
         array_add(decls, decl);
+    }
+}
+
+// ── Build symbol harvesting ─────────────────────────────────────────
+// After diagnostics compiles the project, parse .build/.added_strings_*.jai
+// intermediate files. These contain #insert (and some #run) expansions
+// with source-file mapping in comment headers. Injected declarations
+// are visible to autocomplete, type resolution, and semantic tokens.
+
+extract_generated_from :: (s: string) -> (bool, string, s64) {
+    GENERATED_FROM :: "Generated from ";
+    pos := find_index_from_left(s, GENERATED_FROM);
+    if pos < 0 return false, "", 0;
+
+    start := pos + cast(s64) GENERATED_FROM.count;
+    col_pos := find_index_from_left(s, ":", start);
+    if col_pos <= start return false, "", 0;
+
+    file_path := slice(s, start, col_pos - start);
+    if file_path.count == 0 return false, "", 0;
+
+    line_rest := slice(s, col_pos + 1, s.count - col_pos - 1);
+    if line_rest.count > 0 && line_rest[line_rest.count - 1] == #char "." {
+        line_rest.count -= 1;
+    }
+    line_val, parse_ok := parse_int(*line_rest, s64);
+    if !parse_ok return false, "", 0;
+
+    return true, normalize_and_copy_path(file_path), line_val;
+}
+
+find_decl_at_line :: (file: *Program_File, line: s64) -> *Declaration {
+    // Walk top-level declarations in the source file to find which
+    // declaration's span contains the given line.
+    for node: file.nodes {
+        if node.kind != .DECLARATION continue;
+        decl := cast(*Declaration) node;
+        if decl.location.l0 <= line && decl.location.l1 >= line {
+            return decl;
+        }
+    }
+    return null;
+}
+
+harvest_build_symbols :: () {
+    intermediate_path := server.intermediate_path;
+    if intermediate_path.count == 0 {
+        intermediate_path = ".build";
+    }
+
+    build_dir := join(server.project_root, intermediate_path, separator="/",, temp);
+    if build_dir.count == 0 return;
+    if !file_exists(build_dir) return;
+
+    // Clear inserted_fields — intermediate file AST pool changes each cycle
+    // Free all the member arrays first to avoid leaks
+    for members: server.inserted_fields {
+        array_free(members);
+    }
+    table_reset(*server.inserted_fields);
+
+    for members, name: server.inserted_fields_by_name {
+        array_free(members);
+        if name.count > 0 free(name);
+    }
+    table_reset(*server.inserted_fields_by_name);
+
+    build_files := file_list(build_dir, false,, temp);
+
+    for name: build_files {
+        if !begins_with(name, ".added_strings") continue;
+        if !ends_with(name, ".jai") continue;
+
+        full_path := normalize_path(join(build_dir, name, separator="/",, temp),, temp);
+        if full_path.count == 0 continue;
+
+        // Parse the intermediate file (force=false: skip if already parsed)
+        parse_file(full_path, true, false, false);
+        intermediate_file := get_file(full_path);
+        if !intermediate_file continue;
+
+        // Walk nodes + comments in source order.
+        // Comments like "// #insert text. Generated from /path/file.jai:3."
+        // precede the declarations they generated. Each marker sets the
+        // current source file (+ line of the #insert in that file) for
+        // subsequent declarations.
+        comment_idx: int;
+        current_source: string;
+        current_line: s64;
+
+        for node: intermediate_file.nodes {
+            // Process all comments before this node's start line
+            while comment_idx < intermediate_file.comments.count {
+                cmt := intermediate_file.comments[comment_idx];
+                if cmt.l0 > node.location.l0 break;
+
+                found, source_path, insert_line := extract_generated_from(cmt.string_value);
+                if found {
+                    current_source = source_path;
+                    current_line = insert_line;
+                }
+                comment_idx += 1;
+            }
+
+            if current_source.count == 0 continue;
+
+            target_file := get_file(current_source);
+            if !target_file continue;
+
+            // ── Handle both simple and compound declarations ──────────────
+            // Simple: "Jojo: int;"                    → .DECLARATION
+            // Compound: "Jojo, Jojo_2, Jojo_3: int;" → .COMPOUND_DECLARATION
+
+            if node.kind == .DECLARATION {
+                decl := cast(*Declaration) node;
+
+                // Inject into target file's declaration table
+                lock(*target_file.mutex);
+                table_add(*target_file.declarations, decl.name, decl);
+                unlock(*target_file.mutex);
+
+                // Find the source declaration this was generated for and record it
+                source_decl := find_decl_at_line(target_file, current_line);
+                if source_decl {
+                    lock(*target_file.mutex);
+                    entry_ptr, is_new := find_or_add(*server.inserted_fields, source_decl);
+                    if is_new {
+                        entry_ptr.allocator = context.default_allocator;
+                    }
+                    array_add(entry_ptr, decl);
+                    unlock(*target_file.mutex);
+                }
+            } else if node.kind == .COMPOUND_DECLARATION {
+                cd := cast(*Compound_Declaration) node;
+
+                source_decl := find_decl_at_line(target_file, current_line);
+                if source_decl {
+                    lock(*target_file.mutex);
+                    entry_ptr, is_new := find_or_add(*server.inserted_fields, source_decl);
+                    if is_new {
+                        entry_ptr.allocator = context.default_allocator;
+                    }
+
+                    for member: cd.members {
+                        if member.kind != .COMPOUND_DECLARATION_ITEM continue;
+                        cdi := cast(*Compound_Declaration_Item) member;
+                        if !cdi.expression || cdi.expression.kind != .IDENTIFIER continue;
+                        ident := cast(*Identifier) cdi.expression;
+                        if ident.name.count == 0 continue;
+
+                        // Create a synthetic declaration for each name
+                        // in the compound (e.g., Jojo, Jojo_2, Jojo_3).
+                        synth := New(Declaration);
+                        synth.name = ident.name;
+                        synth.const = false;
+                        synth.has_elsewhere = false;
+                        synth.type_inst = *empty_identifier;
+
+                        array_add(entry_ptr, synth);
+                    }
+
+                    unlock(*target_file.mutex);
+                }
+            }
+        }
     }
 }

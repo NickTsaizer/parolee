@@ -15,6 +15,108 @@ reset_diagnostics :: () {
 // Currently, parse only the first error (maybe parsing multiple errors is not that useful because Jai mostly report one error at a time)
 // @TODO: Make it work with multiple errors
 // @todo: add support for warnings
+// ── Struct type info from compiler ──────────────────────────────────────
+// Parse JAILS_DIAG_STRUCT lines emitted by the diagnostics metaprogram.
+// compiler_report(.INFO) prepends file:line:col: Info: before the message,
+// so we search for the marker anywhere in the line.
+// Format: JAILS_DIAG_STRUCT|type_name|member_count|member1,member2,...
+// Creates synthetic Declaration nodes in server.inserted_fields for
+// #bake_arguments declarations whose instantiated struct name matches.
+
+process_struct_dump :: (output: string) {
+    MARKER :: "JAILS_DIAG_STRUCT|";
+
+    if output.count == 0 {
+        return;
+    }
+
+    lines := split(output, "\n",, temp);
+
+    found: s64;
+    for line: lines {
+        marker_pos := find_index_from_left(line, MARKER);
+        if marker_pos < 0 continue;
+        found += 1;
+
+        // Extract the data part (everything after the marker)
+        data_part := slice(line, marker_pos, line.count - marker_pos);
+
+        // Parse: JAILS_DIAG_STRUCT|name|count|mem1,mem2,mem3
+        parts := split(data_part, "|",, temp);
+        if parts.count < 4 continue;
+        struct_name := parts[1];
+
+        member_str := parts[3];
+        member_names := split(member_str, ",",, temp);
+
+        // Find a #bake_arguments declaration whose name matches this struct
+        // (struct_name is e.g. "Packages(Jay_Render)" — match base name before "(")
+        base_end := find_index_from_left(struct_name, "(");
+        decl_name := struct_name;
+        if base_end > 0 {
+            decl_name = slice(struct_name, 0, base_end);
+        }
+
+        // Name-keyed cache for compiler-known struct fields. This covers
+        // #insert expansions even when we cannot reliably map the dump back
+        // to the exact source Declaration pointer.
+        by_name_ok, _ := table_find(*server.inserted_fields_by_name, decl_name);
+        if !by_name_ok {
+            members_by_name: [..]*Declaration;
+            members_by_name.allocator = context.default_allocator;
+            for mname: member_names {
+                if mname.count == 0 continue;
+                sd := New(Declaration);
+                sd.name = copy_string(mname);
+                sd.const = true;
+                sd.has_elsewhere = false;
+                sd.type_inst = *empty_identifier;
+                array_add(*members_by_name, sd);
+            }
+            table_add(*server.inserted_fields_by_name, copy_string(decl_name), members_by_name);
+        }
+
+        for file: server.files {
+            for node: file.nodes {
+                if node.kind != .DECLARATION continue;
+                nd := cast(*Declaration) node;
+                if nd.name != decl_name continue;
+
+                matches_dump_source: bool;
+                if nd.expression && nd.expression.kind == .DIRECTIVE_BAKE_ARGUMENTS {
+                    matches_dump_source = true;
+                } else if nd.expression {
+                    source_struct := find_struct_of_expression(nd.expression);
+                    if source_struct && source_struct.polymorphic_arguments.count > 0 {
+                        matches_dump_source = true;
+                    }
+                }
+                if !matches_dump_source continue;
+
+                // Found matching declaration — add synthetic declarations
+                lock(*file.mutex);
+                // Skip if already processed (stdout and stderr may both have this)
+                ok, _ := table_find(*server.inserted_fields, nd);
+                    if !ok {
+                        members: [..]*Declaration;
+                        members.allocator = context.default_allocator;
+                        for mname: member_names {
+                            sd := New(Declaration);
+                            sd.name = copy_string(mname);
+                            sd.const = true;
+                            sd.has_elsewhere = false;
+                            sd.type_inst = *empty_identifier;
+                            array_add(*members, sd);
+                        }
+                        table_add(*server.inserted_fields, nd, members);
+                    }
+                unlock(*file.mutex);
+                break;
+            }
+        }
+    }
+}
+
 run_diagnostics :: () {
     if server.build_root.count == 0 return;
     build_root_absolute := join(server.project_root, server.build_root, separator="/");
@@ -54,13 +156,33 @@ run_diagnostics :: () {
 
     reset_diagnostics();
 
-    result, _, error := run_command(..command, working_directory=server.project_root, capture_and_return_output=true, timeout_ms=2500);
+    // Capture both stdout and stderr — struct dump may be in either
+    result, output, error := run_command(..command, working_directory=server.project_root, capture_and_return_output=true, timeout_ms=2500);
+
+    has_struct_dump := contains(output, "JAILS_DIAG_STRUCT|") || contains(error, "JAILS_DIAG_STRUCT|");
+    if result.exit_code == 0 || has_struct_dump {
+        // Replace harvested completion cache only when the compiler produced
+        // a usable struct dump. If the user saves with errors before that,
+        // keep the last known good #insert/#bake_arguments completions.
+        harvest_build_symbols();
+
+        // Parse JAILS_DIAG_STRUCT| lines from compiler output.
+        // These are emitted by the jails_diagnostics metaprogram for every struct
+        // seen during type-checking, including #bake_arguments generated structs.
+        // This populates server.inserted_fields so completions can show real fields
+        // for baked types like Engine(Packages(Jay_Render)).
+        process_struct_dump(output);
+        process_struct_dump(error);
+    }
+
+    // ── Error reporting ──────────────────────────────────────────────
     if result.exit_code == 0 {
+        if output.count > 0 free(output);
+        if error.count > 0 free(error);
         return;
     }
 
-    lines := split(error, "\n");
-    defer array_free(lines);
+    lines := split(error, "\n",, temp);
 
     file: string;
     diagnostic: LSP_Diagnostic;
@@ -116,7 +238,7 @@ run_diagnostics :: () {
     diagnostics: [1]LSP_Diagnostic;
     diagnostics[0] = diagnostic;
 
-    file = path_to_lsp_path(normalize_path(file,, temp)); // split_from_right and slice don't allocate memory so copy the file in case the string with compiler output is freed
+    file = path_to_lsp_path(normalize_path(file,, temp));
 
     lsp_send(LSP_Client_Message(LSP_Publish_Diagnostics).{
         method="textDocument/publishDiagnostics",
@@ -126,10 +248,13 @@ run_diagnostics :: () {
         }
     });
 
-    // Swap before freeing to avoid use-after-free window
     old := server.previously_errored_file;
-    server.previously_errored_file = file;
+    server.previously_errored_file = copy_string(file);
     if file != old {
         free(old);
     }
+
+    if output.count > 0 free(output);
+    if error.count > 0 free(error);
+
 }

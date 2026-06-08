@@ -8,6 +8,12 @@ init_memory_files :: () {
 }
 
 deinit_memory_files :: () {
+    for mf, file_path: server.memory_files {
+        array_free(mf.content);
+        array_free(mf.line_offsets);
+        free(file_path);
+    }
+
     destroy(*server.memory_files_lock);
     deinit(*server.memory_files);
 }
@@ -70,10 +76,19 @@ remove_memory_file :: (file_path: string) {
     array_free(mf.content);
     array_free(mf.line_offsets);
 
+    key_to_free: string;
+    for _, key: server.memory_files {
+        if key == file_path {
+            key_to_free = key;
+            break;
+        }
+    }
+
     found := table_remove(*server.memory_files, file_path);
     if !found {
         log_error("Tried to remove file % but it was not in the server.memory_files table!", file_path);
     }
+    if key_to_free.count > 0 free(key_to_free);
 }
 
 find_range_in_memory_file :: (file: string, range: LSP_Range) -> string {

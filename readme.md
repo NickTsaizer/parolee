@@ -82,6 +82,9 @@ You can create a config file `jails.json` inside your project root to specify:
 ## Run (dev)
 Compile server with `jai build.jai` or compile and run test VSCode with preinstalled LSP with `jai build.jai - -vscode`.
 
+## Integration test (completion docs)
+Run `python3 tests/test_completion_documentation.py` to verify that leading declaration comments are sent as completion `documentation`.
+
 ## Dependencies
 - [jai_parser](https://github.com/SogoCZE/jai_parser)
 - [Jaison](https://github.com/rluba/jaison)

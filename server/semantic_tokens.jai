@@ -249,10 +249,12 @@ emit_declaration_operator :: (node: *Node, entries: *[..]Token_Entry) {
                     if search_from < 0 { search_from = 0; }
                     search_to := rhs.location.c0;
                     if search_to > line_text.count { search_to = line_text.count; }
-                    for i: search_from..search_to - 1 {
-                        if line_text[i] == #char ":" {
-                            add_entry(xx rhs.location.l0, xx i, xx op_len, TOKEN_TYPE_OPERATOR, 0, entries);
-                            break;
+                    if search_from < search_to {
+                        for i: search_from..search_to - 1 {
+                            if line_text[i] == #char ":" {
+                                add_entry(xx rhs.location.l0, xx i, xx op_len, TOKEN_TYPE_OPERATOR, 0, entries);
+                                break;
+                            }
                         }
                     }
                 }
@@ -266,14 +268,18 @@ emit_directive_string :: (node: *Node, entries: *[..]Token_Entry) {
         di := cast(*Directive_Import) node;
         if di.module.count > 0 {
             start := node.location.c1 - di.module.count - 2;  // quotes
-            add_entry(xx node.location.l0, xx start, xx (di.module.count + 2), TOKEN_TYPE_STRING, 0, entries);
+            if start >= 0 {
+                add_entry(xx node.location.l0, xx start, xx (di.module.count + 2), TOKEN_TYPE_STRING, 0, entries);
+            }
         }
     }
     if node.kind == .DIRECTIVE_LOAD {
         dl := cast(*Directive_Load) node;
         if dl.file.count > 0 {
             start := node.location.c1 - dl.file.count - 2;
-            add_entry(xx node.location.l0, xx start, xx (dl.file.count + 2), TOKEN_TYPE_STRING, 0, entries);
+            if start >= 0 {
+                add_entry(xx node.location.l0, xx start, xx (dl.file.count + 2), TOKEN_TYPE_STRING, 0, entries);
+            }
         }
     }
 }

@@ -45,6 +45,9 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
                         extract_dot_var_name = copy_string(to_string(*line_text[start_i], var_len));
                     }
                 }
+                while extract_dot_var_name.count > 0 && extract_dot_var_name[extract_dot_var_name.count - 1] == #char "." {
+                    extract_dot_var_name.count -= 1;
+                }
                 if extract_dot_var_name.count > 0 {
                     // get_node_by_location with .BLOCK filter often fails because
                     // the parser sometimes doesn't set accurate end locations on BLOCKs.
@@ -260,7 +263,20 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
 
     path: [..]*Node;
 
-    array_add(*path, root_binary_op.left);
+    // Expand a BINARY_OPERATION DOT into [left, right, ...] recursively.
+    flatten_dot_path :: (node: *Node, out: *[..]*Node) {
+        if node.kind == .BINARY_OPERATION {
+            op := cast(*Binary_Operation) node;
+            if op.operation == .DOT {
+                if op.left  flatten_dot_path(op.left,  out);
+                if op.right flatten_dot_path(op.right, out);
+                return;
+            }
+        }
+        array_add(out, node);
+    }
+
+    flatten_dot_path(root_binary_op.left, *path);
 
     current := root_binary_op.parent;
     while current && current.kind == .BINARY_OPERATION {
@@ -270,7 +286,7 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
         }
 
         if current_op.left {
-            array_add(*path, current_op.left);
+            flatten_dot_path(current_op.left, *path);
         }
 
         current = current.parent;
@@ -496,6 +512,58 @@ handle_assignment_completitions :: (request: LSP_Request_Message_Completion, cur
     return handle_completitions_for_node(request, left_type);
 }
 
+// ── Local variable scanner ──────────────────────────────────────────────────
+
+// Recursively scan a BLOCK and its sub-blocks for a local variable declaration
+// before cursor_position. Returns the declaration (or null).
+scan_var_in_block :: (block: *Block, var_name: string, cursor_location: Node.Location) -> *Declaration {
+    for member: block.members {
+        if cursor_location.l0 < member.location.l0 continue;
+
+        if member.kind == .DECLARATION {
+            decl := cast(*Declaration) member;
+            if decl.name == var_name return decl;
+        } else if member.kind == .COMPOUND_DECLARATION {
+            cd := cast(*Compound_Declaration) member;
+            for item: cd.members {
+                if item.kind != .COMPOUND_DECLARATION_ITEM continue;
+                cdi := cast(*Compound_Declaration_Item) item;
+                if cdi.expression.kind != .IDENTIFIER continue;
+                if (cast(*Identifier) cdi.expression).name == var_name return cast(*Declaration) cd;
+            }
+        }
+
+        // Recurse into sub-blocks
+        if member.kind == .BLOCK {
+            r := scan_var_in_block(cast(*Block) member, var_name, cursor_location);
+            if r return r;
+        } else if member.kind == .IF {
+            if_node := cast(*If) member;
+            if if_node._then {
+                r := scan_var_in_block(cast(*Block) if_node._then, var_name, cursor_location);
+                if r return r;
+            }
+            if if_node._else {
+                r := scan_var_in_block(cast(*Block) if_node._else, var_name, cursor_location);
+                if r return r;
+            }
+        } else if member.kind == .FOR {
+            for_node := cast(*For) member;
+            if for_node.body {
+                r := scan_var_in_block(cast(*Block) for_node.body, var_name, cursor_location);
+                if r return r;
+            }
+        } else if member.kind == .WHILE {
+            while_node := cast(*While) member;
+            if while_node.body {
+                r := scan_var_in_block(cast(*Block) while_node.body, var_name, cursor_location);
+                if r return r;
+            }
+        }
+    }
+    return null;
+}
+
 // ── Compound declaration helpers ──────────────────────────────────────────
 
 // Scan file.nodes for a declaration matching the variable before a dot.
@@ -518,12 +586,16 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                 dot_col = cast(s32) cursor_location.c0;
             }
             // Try: cursor is after the dot (var.fi → char before cursor = '.')
-            if dot_col < 0 && cursor_location.c0 > 0 && line_text[cursor_location.c0 - 1] == #char "." {
+            if dot_col < 0 && cursor_location.c0 > 0 && cursor_location.c0 - 1 < line_text.count && line_text[cursor_location.c0 - 1] == #char "." {
                 dot_col = cast(s32) cursor_location.c0 - 1;
+            }
+            // Try: cursor past end of line — check last char if it's '.'
+            if dot_col < 0 && line_text.count > 0 && line_text[line_text.count - 1] == #char "." {
+                dot_col = cast(s32) line_text.count - 1;
             }
             if dot_col >= 0 {
                 var_start := dot_col - 1;
-                while var_start >= 0 && ((line_text[var_start] >= #char "a" && line_text[var_start] <= #char "z") || (line_text[var_start] >= #char "A" && line_text[var_start] <= #char "Z") || (line_text[var_start] >= #char "0" && line_text[var_start] <= #char "9") || line_text[var_start] == #char "_") {
+                while var_start >= 0 && ((line_text[var_start] >= #char "a" && line_text[var_start] <= #char "z") || (line_text[var_start] >= #char "A" && line_text[var_start] <= #char "Z") || (line_text[var_start] >= #char "0" && line_text[var_start] <= #char "9") || line_text[var_start] == #char "_" || line_text[var_start] == #char ".") {
                     var_start -= 1;
                 }
                 start_i := var_start + 1;
@@ -536,6 +608,15 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
     }
     if var_name.count == 0 return false, empty;
 
+    // Double/trailing dots like `rs..` can leave `var_name` ending in `.`.
+    // Treat that as the same receiver path (`rs`) instead of creating an
+    // empty final path segment and indexing past the string end.
+    while var_name.count > 0 && var_name[var_name.count - 1] == #char "." {
+        var_name.count -= 1;
+    }
+    if var_name.count == 0 return false, empty;
+
+    // Phase 1 — scan top-level declarations (file.nodes)
     for node: file.nodes {
         if node.kind == .DECLARATION && node.(*Declaration).name == var_name {
             decl := cast(*Declaration) node;
@@ -557,6 +638,188 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                     if fields.count > 0 {
                         return true, fields;
                     }
+                }
+            }
+        }
+    }
+
+    // Phase 2 — scan procedure bodies for local variables
+    for node: file.nodes {
+        if node.kind != .DECLARATION continue;
+        root_decl := cast(*Declaration) node;
+        if !root_decl.expression || root_decl.expression.kind != .PROCEDURE continue;
+        proc := cast(*Procedure) root_decl.expression;
+        if !proc.body continue;
+
+        local_decl := scan_var_in_block(proc.body, var_name, cursor_location);
+        if local_decl {
+            // Resolve type from the local declaration
+            type_source: *Node;
+            if local_decl.kind == .DECLARATION {
+                d := cast(*Declaration) local_decl;
+                type_source = d.type_inst;
+                if !type_source type_source = d.expression;
+            } else if local_decl.kind == .COMPOUND_DECLARATION {
+                cd := cast(*Compound_Declaration) local_decl;
+                type_source = cast(*Node) cd.type_inst;
+            }
+            if type_source {
+                fields := get_type_fields(get_node_type(type_source));
+                if fields.count > 0 {
+                    return true, fields;
+                }
+            }
+        }
+    }
+
+    // Phase 3 — multi-segment path fallback (e.g. "engine.packages").
+    // Keep polymorphic instantiations as PROCEDURE_CALL nodes so implicit
+    // fields like Engine($packages).packages can map to call arguments.
+    if var_name.count > 0 {
+        dot_pos := -1;
+        for i: 0 .. var_name.count - 1 {
+            if var_name[i] == #char "." dot_pos = i;
+        }
+
+        if dot_pos > 0 {
+            seg_count := 1;
+            for c: var_name {
+                if c == #char "." seg_count += 1;
+            }
+
+            seg_names: [..]string;
+            seg_start: int;
+            for idx: 0 .. seg_count - 1 {
+                next_dot := -1;
+                for i: seg_start .. var_name.count - 1 {
+                    if var_name[i] == #char "." {
+                        next_dot = i;
+                        break;
+                    }
+                }
+
+                if next_dot >= 0 {
+                    seg_len := next_dot - seg_start;
+                    array_add(*seg_names, to_string(*var_name[seg_start], seg_len));
+                    seg_start = next_dot + 1;
+                } else {
+                    array_add(*seg_names, to_string(*var_name[seg_start], var_name.count - seg_start));
+                }
+            }
+
+            resolve_type_source_for_path :: (source: *Node) -> *Node {
+                if !source return null;
+                if source.kind == .PROCEDURE_CALL return source;
+                if source.kind == .TYPE_INSTANTIATION {
+                    ti := cast(*Type_Instantiation) source;
+                    if ti.expression return ti.expression;
+                }
+                return get_node_type(source);
+            }
+
+            first_var := seg_names[0];
+            found_decl: *Declaration;
+            for node: file.nodes {
+                if node.kind == .DECLARATION && node.(*Declaration).name == first_var {
+                    found_decl = cast(*Declaration) node;
+                    break;
+                }
+            }
+            if !found_decl {
+                for node: file.nodes {
+                    if node.kind != .DECLARATION continue;
+                    root_decl := cast(*Declaration) node;
+                    if !root_decl.expression || root_decl.expression.kind != .PROCEDURE continue;
+                    proc := cast(*Procedure) root_decl.expression;
+                    if !proc.body continue;
+
+                    local := scan_var_in_block(proc.body, first_var, cursor_location);
+                    if local && local.kind == .DECLARATION {
+                        found_decl = cast(*Declaration) local;
+                        break;
+                    }
+                }
+            }
+
+            if found_decl {
+                type_source: *Node = found_decl.type_inst;
+                if !type_source type_source = found_decl.expression;
+                current_type := resolve_type_source_for_path(type_source);
+                ok := current_type != null;
+
+                for i: 1 .. seg_names.count - 1 {
+                    if !ok break;
+
+                    field_name := seg_names[i];
+                    field_type: *Node;
+                    found_field: bool;
+
+                    if current_type.kind == .STRUCT {
+                        _struct := cast(*Struct) current_type;
+                        if !_struct.block { ok = false; break; }
+
+                        for member: _struct.block.members {
+                            if member.kind != .DECLARATION continue;
+                            mdecl := cast(*Declaration) member;
+                            if mdecl.name != field_name continue;
+
+                            field_type = mdecl.type_inst;
+                            if !field_type field_type = mdecl.expression;
+                            found_field = true;
+                            break;
+                        }
+                    } else if current_type.kind == .PROCEDURE_CALL {
+                        pc := cast(*Procedure_Call) current_type;
+                        if !pc.procedure || pc.procedure.kind != .IDENTIFIER { ok = false; break; }
+
+                        pc_decls := get_identifier_decls(cast(*Identifier) pc.procedure);
+                        for d: pc_decls {
+                            _struct := find_struct_of_expression(d.expression);
+                            if !_struct continue;
+
+                            if _struct.block {
+                                for member: _struct.block.members {
+                                    if member.kind != .DECLARATION continue;
+                                    mdecl := cast(*Declaration) member;
+                                    if mdecl.name != field_name continue;
+
+                                    field_type = mdecl.type_inst;
+                                    if !field_type field_type = mdecl.expression;
+                                    found_field = true;
+                                    break;
+                                }
+                            }
+
+                            if !found_field && _struct.polymorphic_arguments.count > 0 {
+                                for arg, arg_i: _struct.polymorphic_arguments {
+                                    param_name := get_polymorphic_param_name(arg);
+                                    if param_name.count > 0 && param_name == field_name && arg_i < pc.arguments.count {
+                                        field_type = pc.arguments[arg_i];
+                                        found_field = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if found_field break;
+                        }
+                    } else {
+                        ok = false;
+                        break;
+                    }
+
+                    if !found_field || !field_type {
+                        ok = false;
+                        break;
+                    }
+
+                    current_type = resolve_type_source_for_path(field_type);
+                    if !current_type ok = false;
+                }
+
+                if ok {
+                    fields := get_type_fields(current_type);
+                    if fields.count > 0 return true, fields;
                 }
             }
         }
@@ -600,6 +863,87 @@ resolve_compound_var_type :: (cd: *Compound_Declaration, idx: int) -> *Node {
     return null;
 }
 
+// ── Inserted/harvested field helpers ────────────────────────────────────────
+
+append_unique_completion_decl :: (decls: *[..]*Declaration, decl: *Declaration) {
+    for existing: decls.* {
+        if existing.name == decl.name return;
+    }
+    array_add(decls, decl);
+}
+
+append_inserted_fields_for_name :: (decls: *[..]*Declaration, name: string) -> bool {
+    found: bool;
+    ok, inserted_by_name := table_find(*server.inserted_fields_by_name, name);
+    if ok {
+        for field: inserted_by_name {
+            append_unique_completion_decl(decls, field);
+        }
+        found = true;
+    }
+
+    for inserted, source_decl: server.inserted_fields {
+        if !source_decl || source_decl.name != name continue;
+        for field: inserted {
+            append_unique_completion_decl(decls, field);
+        }
+        found = true;
+    }
+    return found;
+}
+
+append_inserted_fields_for_bake_source :: (decls: *[..]*Declaration, decl: *Declaration) -> bool {
+    if !decl.expression || decl.expression.kind != .DIRECTIVE_BAKE_ARGUMENTS return false;
+
+    dba := cast(*Directive_Bake_Arguments) decl.expression;
+    if !dba.expression return false;
+
+    if dba.expression.kind == .IDENTIFIER {
+        ident := cast(*Identifier) dba.expression;
+        return append_inserted_fields_for_name(decls, ident.name);
+    }
+
+    if dba.expression.kind == .PROCEDURE_CALL {
+        pc := cast(*Procedure_Call) dba.expression;
+        if pc.procedure && pc.procedure.kind == .IDENTIFIER {
+            ident := cast(*Identifier) pc.procedure;
+            return append_inserted_fields_for_name(decls, ident.name);
+        }
+    }
+
+    return false;
+}
+
+append_inserted_fields_for_bake_decl_name :: (decls: *[..]*Declaration, name: string) -> bool {
+    for file: server.files {
+        if !file continue;
+        for node: file.nodes {
+            if node.kind != .DECLARATION continue;
+            decl := cast(*Declaration) node;
+            if decl.name != name continue;
+            if append_inserted_fields_for_bake_source(decls, decl) return true;
+        }
+    }
+    return false;
+}
+
+append_inserted_fields_for_decl :: (decls: *[..]*Declaration, decl: *Declaration, label: string = "") {
+    ok, inserted := table_find(*server.inserted_fields, decl);
+    if !ok {
+        // Declarations can be re-parsed between diagnostics harvest and
+        // completion. Pointer-key lookup then misses even though the source
+        // declaration name is stable. Fall back to matching the harvested key
+        // declaration name; this covers compiler struct dumps for baked types.
+        if append_inserted_fields_for_name(decls, decl.name) return;
+        if append_inserted_fields_for_bake_source(decls, decl) return;
+        return;
+    }
+
+    for field: inserted {
+        append_unique_completion_decl(decls, field);
+    }
+}
+
 // Collect type fields for a node without sending any response.
 // Returns decls in declaration form (caller converts to LSP items).
 get_type_fields :: (node: *Node) -> [..]*Declaration {
@@ -631,7 +975,128 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
         case .UNION; #through;
         case .ENUM; #through;
         case .STRUCT;
+            _struct := cast(*Struct) node;
             add_all_fields_of(*decls, node);
+
+            // Add polymorphic parameter names as synthetic fields
+            for arg: _struct.polymorphic_arguments {
+                param_name := get_polymorphic_param_name(arg);
+                if param_name.count == 0 continue;
+                synth_decl := New(Declaration);
+                synth_decl.name = param_name;
+                synth_decl.const = false;
+                synth_decl.has_elsewhere = false;
+                append_unique_completion_decl(*decls, synth_decl);
+            }
+
+            // Add compiler-harvested #insert fields
+            if node.parent && node.parent.kind == .DECLARATION {
+                parent_decl := cast(*Declaration) node.parent;
+                append_inserted_fields_for_decl(*decls, parent_decl, "struct-case");
+
+            }
+        case .TYPE_INSTANTIATION;
+            ti := cast(*Type_Instantiation) node;
+            // If the target expression is an IDENTIFIER, resolve it to its
+            // declaration and get the underlying struct's fields.
+            if ti.expression && ti.expression.kind == .IDENTIFIER {
+                ident := cast(*Identifier) ti.expression;
+                ident_decls := get_identifier_decls(ident);
+                type_decls: [..]*Declaration;
+                array_add(*type_decls, .. ident_decls);
+
+                if type_decls.count == 0 && ident.location.file.count > 0 {
+                    local_file := get_file(ident.location.file);
+                    if local_file {
+                        ok, local_decl := table_find(*local_file.declarations, ident.name);
+                        if ok append_unique_completion_decl(*type_decls, local_decl);
+                    }
+                }
+                for d: type_decls {
+                    _struct := find_struct_of_expression(d.expression);
+                    if _struct {
+                        add_all_fields_of(*decls, _struct);
+                        append_inserted_fields_for_decl(*decls, d, "ti-struct");
+
+                        if _struct.polymorphic_arguments.count > 0 {
+                            for arg, arg_i: _struct.polymorphic_arguments {
+                                param_name := get_polymorphic_param_name(arg);
+                                if param_name.count > 0 {
+                                    synth_decl := New(Declaration);
+                                    synth_decl.name = param_name;
+                                    synth_decl.const = false;
+                                    synth_decl.has_elsewhere = false;
+                                    if ti.expression && ti.expression.kind == .PROCEDURE_CALL {
+                                        proc_call := cast(*Procedure_Call) ti.expression;
+                                        if arg_i < proc_call.arguments.count {
+                                            synth_decl.type_inst = proc_call.arguments[arg_i];
+                                        }
+                                    }
+                                    append_unique_completion_decl(*decls, synth_decl);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        case .PROCEDURE_CALL;
+            proc_call := cast(*Procedure_Call) node;
+            if proc_call.procedure && proc_call.procedure.kind == .IDENTIFIER {
+                ident := cast(*Identifier) proc_call.procedure;
+                ident_decls := get_identifier_decls(ident);
+                proc_type_decls: [..]*Declaration;
+                array_add(*proc_type_decls, .. ident_decls);
+
+                if proc_type_decls.count == 0 {
+                    if ident.location.file.count > 0 {
+                        local_file := get_file(ident.location.file);
+                        if local_file {
+                            ok, local_decl := table_find(*local_file.declarations, ident.name);
+                            if ok append_unique_completion_decl(*proc_type_decls, local_decl);
+                        }
+                    }
+                    if proc_type_decls.count == 0 {
+                        for f: server.files {
+                            ok, found_decl := table_find(*f.declarations, ident.name);
+                            if ok append_unique_completion_decl(*proc_type_decls, found_decl);
+                        }
+                    }
+                }
+                for d: proc_type_decls {
+                    _struct := find_struct_of_expression(d.expression);
+                    if _struct {
+                        add_all_fields_of(*decls, _struct);
+                        append_inserted_fields_for_decl(*decls, d, "proc-call-struct");
+
+                        if _struct.polymorphic_arguments.count > 0 {
+                            for arg, arg_i: _struct.polymorphic_arguments {
+                                param_name := get_polymorphic_param_name(arg);
+                                if param_name.count > 0 {
+                                    synth_decl := New(Declaration);
+                                    synth_decl.name = param_name;
+                                    synth_decl.const = false;
+                                    synth_decl.has_elsewhere = false;
+                                    if arg_i < proc_call.arguments.count {
+                                        synth_decl.type_inst = proc_call.arguments[arg_i];
+                                    } else {
+                                        synth_decl.type_inst = *empty_identifier;
+                                    }
+                                    append_unique_completion_decl(*decls, synth_decl);
+                                }
+                            }
+                        }
+                    } else {
+                        append_inserted_fields_for_decl(*decls, d, "proc-call-else");
+                    }
+                }
+
+                if decls.count == 0 {
+                    if !append_inserted_fields_for_name(*decls, ident.name) {
+                        append_inserted_fields_for_bake_decl_name(*decls, ident.name);
+                    }
+                }
+            }
 
         case .ARRAY_TYPE;
             array_type := cast(*Array_Type, node);

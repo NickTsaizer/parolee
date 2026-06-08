@@ -890,12 +890,13 @@ lsp_window_message :: (format: string, args: ..Any, type: LSP_Window_Show_Messag
 }
 
 lsp_send :: (data: $T) {
+    saved := context.allocator;
+    context.allocator = context.default_allocator;
     body := json_write_string(data);
     // Deep copy to heap — callers (workers) may allocate in temp storage
     // that gets freed after task loop iteration, leaving dangling pointers.
-    saved := context.allocator;
-    context.allocator = context.default_allocator;
     body_copy := copy_string(body);
+    if body.count > 0 free(body);
     context.allocator = saved;
 
     lock(*server.output_queue_mutex);
