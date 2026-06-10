@@ -10,6 +10,11 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
         return;
     }
 
+    // Ensure linked_files is populated — the scheduler's finish_analysis_if_complete
+    // runs after the request handler, so get_declarations below would otherwise
+    // see only [Preload, Runtime_Support] from the file's initial seed.
+    ensure_linked_files(file);
+
     cursor_location := lsp_location_to_node_location(request.params.position, file_path);
 
     // We don't wanna to give completions inside comments.
@@ -160,6 +165,15 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
 
     // General
     decls := get_declarations(file, cursor_node, *cursor_location);
+
+    {
+        valid_count := 0;
+        for d: decls {
+            if d.expression || d.type_inst valid_count += 1;
+        }
+        log("COMPLETION: % decls (% valid), linked_files=% (%)",
+            decls.count, valid_count, file.linked_files.count, file.path);
+    }
 
     // Extract prefix: what user has typed so far.
     prefix: string;

@@ -936,7 +936,7 @@ lsp_respond :: (id: JSON_Value, data: $T) {
 // Completion list wrapper with isIncomplete flag.
 // When the results are truncated (>MAX_COMPLETIONS items), the client knows
 // to re-request as the user types more characters.
-MAX_COMPLETIONS :: 300;
+MAX_COMPLETIONS :: 3000;
 
 LSP_Completion_List :: struct {
     isIncomplete: bool;

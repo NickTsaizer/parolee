@@ -131,7 +131,7 @@ search_for_file :: (name: string) -> *Program_File {
     final_file: *Program_File;
 
     for file, file_name: server.files {
-        if contains(file_name, name) {
+        if file && contains(file_name, name) {
             final_file = file;
         }
     }
@@ -163,6 +163,21 @@ normalize_and_copy_path :: (path: string) -> string {
     str := normalize_path(path);
     context.allocator = saved_allocator;
     return copy_string(str);
+}
+
+// Thread-safe snapshot of all file pointers.
+// Collects under server.files_mutex to prevent races with worker threads
+// that concurrently call parse_file -> table_add(*server.files).
+// Uses temp allocator -- caller must use within temp scope.
+get_all_files_snapshot :: () -> []*Program_File {
+    snapshot: [..]*Program_File;
+    snapshot.allocator = temp;
+    lock(*server.files_mutex);
+    for f: server.files {
+        array_add(*snapshot, f);
+    }
+    unlock(*server.files_mutex);
+    return snapshot;
 }
 
 path_to_lsp_path :: (path: string) -> string {
@@ -336,6 +351,62 @@ analyze_files :: () {
     // }
 
     array_reset(*server.files_to_be_analyzed);
+}
+
+// Ensure a file's linked_files are populated, even before the scheduler loop
+// calls process_analysis_step. Needed because completion/semantic-token
+// handlers may fire before the scheduler runs finish_analysis_if_complete().
+ensure_linked_files :: (file: *Program_File) {
+    if !file return;
+
+    // Always recompute linked_files — the scheduler may have processed this
+    // file before all its "parents" (files that import/load it) were available,
+    // resulting in a sparse linked_files list. Recomputing now picks up any
+    // newly-parsed parent files and their transitive reachable files.
+    // This is safe because: server.files is append-only for parsed files
+    // (existing files are reset+re-parsed, not removed), and get_file_links
+    // iterates the current snapshot.
+    release(*file.analysis_pool);
+
+    // Find Preload and Runtime_Support (under lock)
+    preload_file: *Program_File;
+    runtime_support_file: *Program_File;
+    {
+        lock(*server.files_mutex);
+        for f: server.files {
+            if !runtime_support_file && f && contains(f.path, "Runtime_Support.jai") {
+                runtime_support_file = f;
+            }
+            if !preload_file && f && contains(f.path, "Preload.jai") {
+                preload_file = f;
+            }
+        }
+        unlock(*server.files_mutex);
+    }
+    linked_files := get_file_links(file,, pool_alloc(*file.analysis_pool));
+
+    log("ENSURE_LINKED_FILES: get_file_links returned % linked_files for % (prev had %)",
+        linked_files.count, file.path, file.linked_files.count);
+
+    if file != preload_file && preload_file {
+        array_add(*linked_files, .{ file=preload_file, from_import=true });
+    }
+
+    if file != runtime_support_file && runtime_support_file {
+        array_add(*linked_files, .{ file=runtime_support_file, from_import=true });
+    }
+
+    file.linked_files = linked_files;
+
+    // Remove from files_to_be_analyzed (under lock)
+    lock(*server.files_mutex);
+    for i: 0 .. server.files_to_be_analyzed.count - 1 {
+        if server.files_to_be_analyzed[i] == file {
+            array_ordered_remove_by_index(*server.files_to_be_analyzed, i);
+            break;
+        }
+    }
+    unlock(*server.files_mutex);
 }
 
 // Incremental analysis: process ONE file per call from the scheduler loop.
@@ -698,6 +769,11 @@ get_file_links :: (file: *Program_File) -> [..]Linked_File {
         array_add(*linked_files, .{ file=it, from_import=from_import });
     }
 
+    log("GET_FILE_LINKS: % -> % linked files", file.path, linked_files.count);
+    for lf: linked_files {
+        if lf.file log("  LINKED: % (from_import=%)", lf.file.path, lf.from_import);
+    }
+
     return linked_files;
 }
 
@@ -1033,6 +1109,7 @@ get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *No
 
             // Protect against concurrent modification by worker threads
             // (workers call parse_file -> node_visit -> table_add(*file.declarations))
+            if !linked_file.file continue;  // safety: null from concurrent table modification
             lock(*linked_file.file.mutex);
             // We are searching for specific decl
             if name.count > 0 {
@@ -1135,11 +1212,18 @@ get_files_that_use :: (target_file: *Program_File) -> []*Program_File {
 
 get_files_that_load :: (target_file: *Program_File) -> []*Program_File {
     files: [..]*Program_File;
+    target := target_file.path;
 
+    count := 0;
     for file: server.files {
-        if !is_avaiable_from(file, target_file.path, true) continue;
+        if !file continue;
+        count += 1;
+        if !is_avaiable_from(file, target, true) continue;
         array_add(*files, file);
     }
+    log("FILES_THAT_LOAD: target=% files_in_server=% found=%", target, count, files.count);
+
+    for f: files log("  PARENT: %", f.path);
 
     return files;
 }
@@ -1161,7 +1245,10 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
             array_add(already_checked, it.root);
 
             if it.root == path {
-                from_import = true;
+                // Direct import: the current file directly imports the target.
+                // #scope_module declarations in directly-imported files should
+                // be visible because the importing file joins the module scope.
+                from_import = false;
                 loaded = true;
                 break;
             }
@@ -1169,11 +1256,14 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
             next_file := get_file(it.root);
             if !next_file continue;
 
-            found: bool;
-            found = is_avaiable_from_impl(next_file, path, already_checked, false);
+            found, child_from_import := is_avaiable_from_impl(next_file, path, already_checked, false);
 
             if found {
-                from_import = true;
+                // Use child's from_import: if the child found the target through
+                // its own loads (from_import=false), propagate that up. Only
+                // set from_import=true when the child itself found it through
+                // an import chain, meaning we have 2+ import hops from origin.
+                from_import = child_from_import;
                 loaded = true;
                 break;
             }

@@ -392,12 +392,25 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             server.skip_reanalyze = true;
             defer server.skip_reanalyze = false;
             {
+                    log("INIT: parsing Runtime_Support...");
                 parse_file(tprint("%/modules/Runtime_Support.jai", server.args.jai_path), true);
+                log("INIT: parsing Preload...");
                 parse_file(tprint("%/modules/Preload.jai", server.args.jai_path), true);
+
+                log("INIT: parsing roots...");
+                for root: server.roots {
+                    root_path := join(server.project_root, root, separator="/");
+                    if root_path.count > 0 {
+                        log("INIT: parsing root: %", root_path);
+                        parse_file(root_path, false, true, true);
+                    }
+                }
             }
 
+            log("INIT: analyze_files...");
             analyze_files();
 
+            log("INIT: respond...");
             to_send: LSP_Result_Initialize;
             lsp_respond(body.id, to_send);
 
@@ -438,9 +451,72 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             create_memory_file(file_path, content);
 
-            // Shallow parse: current file only, imports deferred to background
-            parse_file(file_path, true, true);
-            server.needs_reanalyze = false;
+            // Synchronous parse: follow all imports recursively so transitive
+            // dependencies (Jay_Core, sgpu, etc.) are in server.files before
+            // completion/semantic-token handlers fire. Background analysis
+            // in process_analysis_step still populates linked_files later.
+            parse_file(file_path, true);  // force=true, shallow=false (default), follow_all=true (default)
+
+            // Re-parse loader files so their imports cascade transitively.
+            // When package.jai (no imports) is opened, module.jai (which loads
+            // it) needs re-parsing with follow_all=true so #import "Jay_Core"
+            // resolves — otherwise Jay_Core symbols never appear.
+            // NOTE: collect loader paths first, iterate after — parse_file
+            // may allocate on `temp` and corrupt snapshot memory.
+            // Parse loaders: files that #load the opened file.
+            // First check already-parsed files (from previous init passes).
+            {
+                loader_paths: [..]string;
+                loader_paths.allocator = context.default_allocator;
+                lock(*server.files_mutex);
+                for f: server.files {
+                    if !f || f.path == file_path continue;
+                    loaded, _ := is_avaiable_from(f, file_path, true); // loads_only=true
+                    if loaded {
+                        array_add(*loader_paths, copy_string(f.path));
+                    }
+                }
+                unlock(*server.files_mutex);
+                for path: loader_paths {
+                    log("Re-parsing loader '%' due to didOpen of '%'", path, file_path);
+                    parse_file(path, true);
+                    free(path);
+                }
+                array_free(loader_paths);
+            }
+
+            // Also parse any pending deferred imports synchronously so loader
+            // files (parsed shallowly during init) are available for immediate
+            // completions. Workers pick up remaining deferred imports later.
+            lock(*server.deferred_mutex);
+            pending_paths: [..]string;
+            pending_paths.allocator = context.default_allocator;
+            for defer_path: server.deferred_imports {
+                array_add(*pending_paths, copy_string(defer_path));
+            }
+            array_reset(*server.deferred_imports);
+            unlock(*server.deferred_mutex);
+            for defer_path: pending_paths {
+                parse_file(defer_path, false, true, false); // shallow=true, follow_all=false
+                free(defer_path);
+            }
+            array_free(pending_paths);
+
+            // Disk-based loader discovery: if the opened file wasn't found as
+            // a load target of any already-parsed file, check if a module.jai
+            // exists in the same directory. Jai convention: module.jai loads
+            // all files in its module (e.g. #load "pool.jai").
+            // This handles the case where the import chain from roots doesn't
+            // reach the module (e.g. sgpu/module.jai is never parsed during
+            // init because no root file imports it).
+            module_dir := path_strip_filename(file_path);
+            module_path := normalize_path(join(module_dir, "/module.jai"));
+            if get_file(module_path) == null && file_exists(module_path) {
+                log("DISK_LOADER: parsing module.jai from disk: %", module_path);
+                parse_file(module_path, true);
+            }
+
+            server.needs_reanalyze = true;
 
             // Run diagnostics after initial indexing so compiler-harvested
             // #insert/#bake_arguments completions are available without an
@@ -559,6 +635,8 @@ dispatch_imports :: () {
     already_busy := server.busy_workers;
     unlock(*server.task_queue_mutex);
     if already_busy >= server.num_workers return;
+
+
 
     batch_size := min(PARALLEL_BATCH, count);
     available := server.num_workers - already_busy;
@@ -684,6 +762,10 @@ worker_proc :: (thread: *Thread) -> s64 {
 
         // Execute
         if task.type == .parse_import {
+            // follow_all=false: restrict transitive import loading.
+            // Bare #import (non-using) are recorded but NOT deferred here —
+            // they are resolved when the file is re-parsed via didOpen
+            // with shallow=false, follow_all=true (synchronous + transitive).
             parse_file(task.file_path, false, task.shallow, false); // imported → restrict transitive
             if task.file_path.count > 0 free(task.file_path);
         }
