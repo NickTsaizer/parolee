@@ -80,6 +80,11 @@ build_semantic_tokens :: (id: JSON_Value, uri: string, range_start: Node.Locatio
 
     has_range := range_start.l0 > 0 || range_end.l0 > 0;
 
+    // Fix up missing parent pointers before token collection.
+    // The parser doesn't set parent for children of POLYMORPHIC_CONSTANT
+    // (e.g., $MT, /Matrix) or Return_Value (e.g., -> MT).
+    fix_ast_parents(file);
+
     // Collect all tokens (range-aware: skips nodes outside bounds)
     entries: [..]Token_Entry;
     collect_tokens(file, *entries, range_start, range_end, has_range);
@@ -122,6 +127,32 @@ collect_tokens :: (file: *Program_File, entries: *[..]Token_Entry,
             if comment.l0 < xx range_start.l0 || comment.l0 > xx range_end.l0 continue;
         }
         add_entry(xx comment.l0, xx comment.c0, xx (comment.c1 - comment.c0), TOKEN_TYPE_COMMENT, 0, entries);
+    }
+}
+
+// ── AST parent fixup ────────────────────────────────────────────────────
+// The parser does not set node.parent for children of certain node kinds
+// (Polymorphic_Constant, Return_Value). This pass patches them so that
+// classify_identifier can check type-position contexts correctly.
+// Idempotent — safe to call multiple times on the same file.
+
+fix_ast_parents :: (file: *Program_File) {
+    for node: file.nodes {
+        if node.kind == .POLYMORPHIC_CONSTANT {
+            pc := cast(*Polymorphic_Constant) node;
+            if pc.expression && (!pc.expression.parent || pc.expression.parent == *file.global_block) {
+                pc.expression.parent = node;
+            }
+            if pc.restriction && (!pc.restriction.parent || pc.restriction.parent == *file.global_block) {
+                pc.restriction.parent = node;
+            }
+        }
+        if node.kind == .RETURN_VALUE {
+            rv := cast(*Return_Value) node;
+            if rv.expression && (!rv.expression.parent || rv.expression.parent == *file.global_block) {
+                rv.expression.parent = node;
+            }
+        }
     }
 }
 
@@ -169,6 +200,64 @@ token_span :: (node: *Node, token_type: u32) -> Token_Span {
                 len = u.expression.location.c0 - col;
             }
         }
+    } else if token_type == TOKEN_TYPE_MACRO {
+        col = loc.c0 - 1;  // include '#'
+        len_explicitly_set := false;
+        if node.kind == .DIRECTIVE_IMPORT {
+            di := cast(*Directive_Import) node;
+            len = 7;  // "#import"
+            if di.import_kind == .FILE len = 12;     // "#import,file"
+            else if di.import_kind == .DIR len = 11; // "#import,dir"
+            else if di.import_kind == .STRING len = 14; // "#import,string"
+            len_explicitly_set = true;
+        } else if node.kind == .DIRECTIVE_LOAD {
+            len = 5;  // "#load"
+            len_explicitly_set = true;
+        } else if node.kind == .DIRECTIVE_RUN {
+            len = 4;  // "#run"
+            len_explicitly_set = true;
+        } else if node.kind == .DIRECTIVE_EXISTS {
+            len = 7;  // "#exists"
+            len_explicitly_set = true;
+        } else if node.kind == .IF {
+            if_node := cast(*If) node;
+            if if_node.compile_time {
+                len = 3;  // "#if"
+                if if_node.if_kind == .IFX len = 4;  // "#ifx"
+                len_explicitly_set = true;
+            }
+        } else if node.kind == .DIRECTIVE_SCOPE {
+            ds := cast(*Directive_Scope) node;
+            if ds.scope_kind == .EXPORT len = 13;       // "#scope_export"
+            else if ds.scope_kind == .FILE len = 11;    // "#scope_file"
+            else if ds.scope_kind == .MODULE len = 13;  // "#scope_module"
+            len_explicitly_set = true;
+        } else if node.kind == .DIRECTIVE_TYPE {
+            len = 5;  // "#type"
+            len_explicitly_set = true;
+        } else if node.kind == .DIRECTIVE_INSERT {
+            len = 7;  // "#insert"
+            len_explicitly_set = true;
+        } else if node.kind == .DIRECTIVE_OVERLAY {
+            len = 8;  // "#overlay"
+            len_explicitly_set = true;
+        } else if node.kind == .DIRECTIVE_ASSERT {
+            len = 7;  // "#assert"
+            len_explicitly_set = true;
+        } else if node.kind == .DIRECTIVE_MODULE_PARAMETERS {
+            len = 18;  // "#module_parameters"
+            len_explicitly_set = true;
+        }
+
+        // Fallback: for directives without explicit length, the raw span
+        // (loc.c1 - loc.c0) doesn't include the #. Add 1 to account for it.
+        if !len_explicitly_set {
+            len += 1;
+        }
+
+        // Safety cap: if span is unreasonably large (uninitialized node location),
+        // highlight just the # so editors don't paint huge regions.
+        if len > 50 { len = 1; }
     }
 
     // Multi-line tokens: skip unless they're declarations, keywords, or macros
@@ -187,12 +276,18 @@ keyword_length :: (node: *Node) -> int {
         case .RETURN; return 6;
         case .FOR; return 3;
         case .WHILE; return 5;
-        case .IF; return 2;
+        case .IF;
+            if_node := cast(*If) node;
+            if if_node.if_kind == .IFX return 3;
+            return 2;
         case .BREAK; return 5;
         case .CONTINUE; return 8;
         case .DEFER; return 5;
         case .REMOVE; return 6;
-        case .CAST; return 4;
+        case .CAST;
+            cast_node := cast(*Cast) node;
+            if cast_node.auto return 2;  // "xx"
+            return 4;  // "cast"
         case .USING; return 5;
         case .STRUCT; return 6;
         case .ENUM; return 4;
@@ -223,6 +318,27 @@ emit_declaration_operator :: (node: *Node, entries: *[..]Token_Entry) {
             // op_len stays 2
         }
         add_entry(xx decl.location.l0, xx op_col, xx op_len, TOKEN_TYPE_OPERATOR, 0, entries);
+
+        // name : Type = expr — emit = (or :) between type_inst and expression
+        if decl.type_inst && decl.expression {
+            search_from := decl.type_inst.location.c1;
+            search_to := decl.expression.location.c0;
+            if search_from > 0 && search_to > search_from {
+                lsp_pos: LSP_Position;
+                lsp_pos.line = cast(u32) node.location.l0;
+                lsp_pos.character = 0;
+                line_text := find_line_in_memory_file(node.location.file, lsp_pos);
+                if line_text.count > 0 {
+                    if search_to > line_text.count { search_to = line_text.count; }
+                    for i: search_from .. search_to - 1 {
+                        if line_text[i] == #char "=" || line_text[i] == #char ":" {
+                            add_entry(xx node.location.l0, xx i, xx 1, TOKEN_TYPE_OPERATOR, 0, entries);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
     if node.kind == .COMPOUND_DECLARATION {
         cd := cast(*Compound_Declaration) node;
@@ -267,10 +383,9 @@ emit_directive_string :: (node: *Node, entries: *[..]Token_Entry) {
     if node.kind == .DIRECTIVE_IMPORT {
         di := cast(*Directive_Import) node;
         if di.module.count > 0 {
-            start := node.location.c1 - di.module.count - 2;  // quotes
-            if start >= 0 {
-                add_entry(xx node.location.l0, xx start, xx (di.module.count + 2), TOKEN_TYPE_STRING, 0, entries);
-            }
+            add_entry(xx di.module_string_location.l0, xx di.module_string_location.c0,
+                      xx (di.module_string_location.c1 - di.module_string_location.c0),
+                      TOKEN_TYPE_STRING, 0, entries);
         }
     }
     if node.kind == .DIRECTIVE_LOAD {
@@ -307,8 +422,9 @@ classify_node :: (node: *Node) -> u32, u32, bool {
             tt, mod, _ := classify_identifier(node, parent);
             return tt, mod, true;
         case .LITERAL;
-            tt, mod, _ := classify_literal(node);
-            return tt, mod, true;
+            tt, mod, got := classify_literal(node);
+            if got return tt, mod, true;
+            return 0, 0, false;
         case .COMMENT;
             return TOKEN_TYPE_COMMENT, 0, true;
         case .NOTE;
@@ -354,8 +470,12 @@ classify_node :: (node: *Node) -> u32, u32, bool {
             return TOKEN_TYPE_MACRO, 0, true;
         case .RETURN;            #through;
         case .FOR;               #through;
-        case .WHILE;             #through;
-        case .IF;                #through;
+        case .WHILE;
+            return TOKEN_TYPE_KEYWORD, 0, true;
+        case .IF;
+            if_node := cast(*If) node;
+            if if_node.compile_time return TOKEN_TYPE_MACRO, 0, true;
+            #through;
         case .BREAK;             #through;
         case .CONTINUE;          #through;
         case .DEFER;             #through;
@@ -414,11 +534,96 @@ classify_declaration :: (node: *Node, parent: *Node) -> u32, u32, bool {
 // Order: contextual checks (procedure call, type position) → declaration
 // lookup (expression kind, parent enum) → fallback (variable).
 
+Identifier_Kind :: enum u32 {
+    UNRESOLVED;
+    MODULE_IMPORT;   // #import or #load
+    PROCEDURE;       // procedure declaration
+    TYPE_DEFINITION; // struct, union, enum declaration
+    CONSTANT;        // :: (const, not proc/struct/enum)
+    ENUM_MEMBER;     // inside an enum
+    VARIABLE;        // := or inferred
+}
+
+// Resolve what kind of entity an identifier refers to, via declaration lookup.
+resolve_identifier_kind :: (ident: *Identifier) -> Identifier_Kind {
+    decls := get_identifier_decls(ident);
+    if decls.count > 0 {
+        decl := decls[0];
+        if decl.expression {
+            if decl.expression.kind == .DIRECTIVE_IMPORT || decl.expression.kind == .DIRECTIVE_LOAD
+                return .MODULE_IMPORT;
+            if decl.expression.kind == .PROCEDURE return .PROCEDURE;
+            if decl.expression.kind == .STRUCT || decl.expression.kind == .UNION || decl.expression.kind == .ENUM
+                return .TYPE_DEFINITION;
+        }
+        if decl.parent && decl.parent.kind == .ENUM return .ENUM_MEMBER;
+        if decl.const return .CONSTANT;
+        return .VARIABLE;
+    }
+
+    // Built-in types — no user declaration, but intrinsic to the language.
+    if ident.name.count > 0 && is_builtin_type_name(ident.name) return .TYPE_DEFINITION;
+
+    return .UNRESOLVED;
+}
+
+// ── Built-in type names ────────────────────────────────────────────────
+// Jai intrinsic types: no user declaration, but semantically TYPE_DEFINITION.
+
+is_builtin_type_name :: (name: string) -> bool {
+    if name == "string"  return true;
+    if name == "int"     return true;
+    if name == "s64"     return true;
+    if name == "s32"     return true;
+    if name == "s16"     return true;
+    if name == "s8"      return true;
+    if name == "u64"     return true;
+    if name == "u32"     return true;
+    if name == "u16"     return true;
+    if name == "u8"      return true;
+    if name == "float"   return true;
+    if name == "float32" return true;
+    if name == "float64" return true;
+    if name == "bool"    return true;
+    if name == "void"    return true;
+    return false;
+}
+
 classify_identifier :: (node: *Node, parent: *Node) -> u32, u32, bool {
-    // Contextual: the position of the identifier determines its role
+    ident := cast(*Identifier) node;
+    kind := resolve_identifier_kind(ident);
+
+    // Context-based checks — how the identifier is USED matters.
     if parent {
-        if is_procedure_call_target(node, parent) return TOKEN_TYPE_FUNCTION, 0, true;
-        if is_in_type_position(node, parent) return TOKEN_TYPE_TYPE, 0, true;
+        // Procedure call target — function call or type instantiation.
+        // If the identifier IS a type (struct/union/enum), calling it is
+        // a type instantiation (e.g., Matrix(2,2,float64) in :: context).
+        if is_procedure_call_target(node, parent) {
+            if kind == .TYPE_DEFINITION return TOKEN_TYPE_TYPE, 0, true;
+            return TOKEN_TYPE_FUNCTION, 0, true;
+        }
+
+        // Type position — but not for module imports (WASM.func())
+        if kind != .MODULE_IMPORT {
+            if is_in_type_position(node, parent) return TOKEN_TYPE_TYPE, 0, true;
+        }
+
+        // Polymorphic constant: $T/Type — T is the type parameter name
+        if parent.kind == .POLYMORPHIC_CONSTANT {
+            pc := cast(*Polymorphic_Constant) parent;
+            if pc.expression == node return TOKEN_TYPE_TYPE_PARAM, 0, true;
+            // restriction (Type in $T/Type) falls through to normal classification
+        }
+
+        // Procedure return type: -> Type or -> (Type, Type)
+        // Parent is the Procedure (parser sets child.parent = procedure, not Return_Value)
+        if parent.kind == .PROCEDURE {
+            proc := cast(*Procedure) parent;
+            for rv: proc.returns {
+                if rv.expression == node return TOKEN_TYPE_TYPE, 0, true;
+            }
+        }
+
         if parent.kind == .FOR {
             f := cast(*For) parent;
             if node == f.value || node == f.index || node == f.iterator {
@@ -428,28 +633,69 @@ classify_identifier :: (node: *Node, parent: *Node) -> u32, u32, bool {
         if parent.kind == .COMPOUND_DECLARATION_ITEM {
             item := cast(*Compound_Declaration_Item) parent;
             if item.item_kind == .DECLARATION {
+                // Identifier could be a declaration name (a, b in "a, b: int")
+                // OR a type annotation (string in "path: string" when parser
+                // incorrectly wraps the type in a Compound_Declaration_Item).
+                if kind == .TYPE_DEFINITION return TOKEN_TYPE_TYPE, 0, true;
                 return TOKEN_TYPE_VARIABLE, MODIFIER_DECLARATION, true;
             }
         }
     }
 
-    // Declaration lookup: what was this identifier bound to?
-    ident := cast(*Identifier) node;
-    decls := get_identifier_decls(ident);
-    if decls.count > 0 {
-        decl := decls[0];
-        if decl.expression {
-            if decl.expression.kind == .PROCEDURE return TOKEN_TYPE_FUNCTION, 0, true;
-            if decl.expression.kind == .STRUCT || decl.expression.kind == .UNION return TOKEN_TYPE_TYPE, 0, true;
-            if decl.expression.kind == .ENUM return TOKEN_TYPE_TYPE, 0, true;
-        }
-        if decl.parent && decl.parent.kind == .ENUM return TOKEN_TYPE_ENUM_MEMBER, 0, true;
+    // Kind-based classification — what the identifier IS determines its token.
+    if kind == .PROCEDURE return TOKEN_TYPE_FUNCTION, 0, true;
+    if kind == .TYPE_DEFINITION return TOKEN_TYPE_TYPE, 0, true;
+    if kind == .ENUM_MEMBER return TOKEN_TYPE_ENUM_MEMBER, 0, true;
+    if kind == .CONSTANT return TOKEN_TYPE_VARIABLE, MODIFIER_READONLY, true;
+    if kind == .VARIABLE return TOKEN_TYPE_VARIABLE, 0, true;
+    if kind == .MODULE_IMPORT {
+        // Module import used in a non-call context (e.g., standalone WASM).
+        // Falls through to naming heuristic below.
     }
 
-    // Heuristic: uppercase-first identifiers are likely types (Type.{}, Type.field, etc.)
+    // Naming heuristic fallback — for UNRESOLVED and MODULE_IMPORT.
     if ident.name.count > 0 {
         c := ident.name[0];
         if c >= #char "A" && c <= #char "Z" {
+            // Right side of DOT member access → enum member
+            // (unless left side is lowercase, meaning variable member access)
+            if parent && parent.kind == .BINARY_OPERATION {
+                bin := cast(*Binary_Operation) parent;
+                if bin.operation == .DOT && bin.right == node {
+                    left_node := bin.left;
+                    // Lowercase-left → variable member (e.g., arch.SIZE)
+                    if left_node && left_node.kind == .IDENTIFIER {
+                        left_ident := cast(*Identifier) left_node;
+                        if left_ident.name.count > 0 {
+                            lc := left_ident.name[0];
+                            if lc >= #char "a" && lc <= #char "z" {
+                                // Variable member — fall through
+                            } else {
+                                return TOKEN_TYPE_ENUM_MEMBER, 0, true;
+                            }
+                        }
+                    } else {
+                        return TOKEN_TYPE_ENUM_MEMBER, 0, true;
+                    }
+                }
+            }
+            // Prefix DOT (inferred-type enum): .EnumMember
+            // Parsed as UNARY_OPERATION(DOT) + IDENTIFIER
+            if parent && parent.kind == .UNARY_OPERATION {
+                u := cast(*Unary_Operation) parent;
+                if u.operation == .DOT {
+                    return TOKEN_TYPE_ENUM_MEMBER, 0, true;
+                }
+            }
+            // All-uppercase (SCREAMING_CASE) → likely a constant
+            all_upper := true;
+            for name: ident.name {
+                if name >= #char "a" && name <= #char "z" { all_upper = false; break; }
+            }
+            if all_upper {
+                return TOKEN_TYPE_VARIABLE, MODIFIER_READONLY, true;
+            }
+            // Mixed case → likely a type
             return TOKEN_TYPE_TYPE, 0, true;
         }
     }
@@ -463,6 +709,7 @@ classify_literal :: (node: *Node) -> u32, u32, bool {
     lit := cast(*Literal) node;
     if lit.value_type == { case .STRING; return TOKEN_TYPE_STRING, 0, true; }
     if lit.value_type == { case .INT; #through; case .FLOAT; return TOKEN_TYPE_NUMBER, 0, true; }
+    if lit.value_type == { case .BOOL; return TOKEN_TYPE_KEYWORD, 0, true; }
     return 0, 0, false;
 }
 
@@ -471,7 +718,43 @@ classify_literal :: (node: *Node) -> u32, u32, bool {
 is_procedure_call_target :: (node: *Node, parent: *Node) -> bool {
     if parent.kind != .PROCEDURE_CALL return false;
     pc := cast(*Procedure_Call) parent;
-    return pc.procedure == node;
+    if pc.procedure != node return false;
+
+    // Walk up through type-expression wrappers (UNARY_OPERATION for *Type)
+    // tracking the outermost chain node. If it matches a type context
+    // (decl.type_inst or return_value.expression), this is a type
+    // instantiation, not a function call.
+    p := parent;
+    outer := p;  // outermost wrapper node in the chain
+    while p {
+        gp := p.parent;
+        if !gp break;
+
+        if gp.kind == .DECLARATION {
+            decl := cast(*Declaration) gp;
+            if decl.type_inst == outer return false;  // type instantiation
+            return true;  // expression → function call
+        }
+
+        if gp.kind == .PROCEDURE {
+            proc := cast(*Procedure) gp;
+            for rv: proc.returns {
+                if rv.expression == outer return false;  // return type → type instantiation
+            }
+            break;  // not in a return type → function call
+        }
+
+        // Walk through transparent type wrappers
+        if p.kind == .UNARY_OPERATION || p.kind == .PROCEDURE_CALL {
+            outer = gp;
+            p = gp;
+            continue;
+        }
+
+        break;
+    }
+
+    return true;
 }
 
 is_in_type_position :: (node: *Node, parent: *Node) -> bool {
@@ -482,7 +765,8 @@ is_in_type_position :: (node: *Node, parent: *Node) -> bool {
     if parent.kind == .CAST && cast(*Cast, parent).cast_expression == node return true;
     if parent.kind == .ARRAY_TYPE {
         at := cast(*Array_Type) parent;
-        if at.element_type == node || at.dimension == node return true;
+        if at.element_type == node return true;
+        // dimension is an expression (array size), not a type
     }
     // Struct literal prefix: Type.{} — left of dot is type, right is struct literal.
     // NOT chain access: a.b.c — right side is another DOT (BINARY_OPERATION).
@@ -490,6 +774,7 @@ is_in_type_position :: (node: *Node, parent: *Node) -> bool {
         bin := cast(*Binary_Operation) parent;
         if bin.operation == .DOT && bin.left == node && bin.right &&
            bin.right.kind != .IDENTIFIER && bin.right.kind != .BINARY_OPERATION {
+
             return true;
         }
     }

@@ -123,6 +123,28 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     }
 
     if cursor_node {
+        // #import / #load directive completion
+        if cursor_node.kind == .DIRECTIVE_IMPORT {
+            handle_completitions_import(request, xx cursor_node);
+            return;
+        }
+        if cursor_node.kind == .DIRECTIVE_LOAD {
+            handle_completitions_load(request, file, xx cursor_node);
+            return;
+        }
+
+        // Cursor inside directive string argument (#import "X" or #load "path")
+        if cursor_node.kind == .DIRECTIVE_STRING {
+            if cursor_node.parent && cursor_node.parent.kind == .DIRECTIVE_IMPORT {
+                handle_completitions_import(request, xx cursor_node.parent);
+                return;
+            }
+            if cursor_node.parent && cursor_node.parent.kind == .DIRECTIVE_LOAD {
+                handle_completitions_load(request, file, xx cursor_node.parent);
+                return;
+            }
+        }
+
         // Prefer source-text receiver scan before node-tree dot resolution.
         // Node-tree resolution can choose the type declaration (Type.) rather
         // than the instance declaration (v.) when cursor sits at dot boundary.
@@ -180,6 +202,44 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     if cursor_node && cursor_node.kind == .IDENTIFIER {
         ident := cast(*Identifier) cursor_node;
         prefix = ident.name;
+    } else {
+        // cursor_node is null or not an identifier — scan source text.
+        // Cursor sits just past the typed token (LSP convention), so
+        // get_node_by_location's contains() misses it. Extract prefix
+        // by walking backwards from cursor to find the identifier start.
+        if cursor_location.c0 > 0 {
+            lsp_pos: LSP_Position;
+            lsp_pos.line = cast(u32) cursor_location.l0;
+            lsp_pos.character = cast(u32) cursor_location.c0;
+            line_text := find_line_in_memory_file(file_path, lsp_pos);
+            if line_text.count > 0 {
+                end := cursor_location.c0;
+                if end > line_text.count then end = line_text.count;
+                start := end - 1;
+                while start >= 0 {
+                    ch := line_text[start];
+                    if !(ch >= #char "a" && ch <= #char "z") &&
+                       !(ch >= #char "A" && ch <= #char "Z") &&
+                       !(ch >= #char "0" && ch <= #char "9") &&
+                       ch != #char "_" {
+                        start += 1;
+                        break;
+                    }
+                    start -= 1;
+                }
+                if start < 0 then start = 0;
+                if end > start {
+                    prefix = copy_string(to_string(*line_text[start], end - start));
+                }
+            }
+        }
+    }
+
+    {
+        node_kind_str: string = "null";
+        if cursor_node node_kind_str = sprint("%", cursor_node.kind);
+        log("COMPLETION PREFIX: node=% kind=% prefix='%' cursor_l%=c%",
+            cursor_node, node_kind_str, prefix, cursor_location.l0, cursor_location.c0);
     }
 
     send_completions_decls(request, decls, file=file, prefix=prefix);
@@ -1454,6 +1514,8 @@ send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*De
                     item.insertText = decl.name;
                 }
 
+                // ast_print_procedure_header only prints the signature,
+                // not the body — cheap per call.
                 item.labelDetails.description = ast_print_to_string(preview_node);
 
             case .STRUCT;

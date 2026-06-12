@@ -21,6 +21,21 @@ Program_File :: struct {
     mutex: Mutex;  // guards declarations + nodes during concurrent worker access
 }
 
+// Non-blocking mutex lock attempt.
+// Returns true if lock was acquired (caller must unlock), false if held by another thread.
+// Used by get_declarations to avoid blocking the completion handler when a worker
+// thread is actively analyzing a linked file.
+try_lock :: (mutex: *Mutex) -> bool {
+    #if OS == .LINUX {
+        libpthread :: #library,system "libpthread";
+        pthread_mutex_trylock :: (m: *void) -> s32 #foreign libpthread;
+        return pthread_mutex_trylock(cast(*void) *mutex.csection) == 0;
+    } else {
+        lock(mutex);
+        return true;
+    }
+}
+
 Linked_File :: struct {
     from_import: bool;
     file: *Program_File;
@@ -102,12 +117,14 @@ deinit_inserted_fields :: () {
 }
 
 reset_file :: (using file: Program_File) {
+    lock(*file.mutex);
     table_reset(*declarations);
     array_reset(*nodes);
     array_reset(*loads);
     array_reset(*imports);
     array_reset(*comments);
     release(*file.ast_pool);
+    unlock(*file.mutex);
 }
 
 get_file :: (path: string) -> *Program_File {
@@ -356,19 +373,27 @@ analyze_files :: () {
 // Ensure a file's linked_files are populated, even before the scheduler loop
 // calls process_analysis_step. Needed because completion/semantic-token
 // handlers may fire before the scheduler runs finish_analysis_if_complete().
+// Uses a cheap pre-check (get_files_that_load) before the expensive full DFS
+// (get_file_links). Once linked_files has more than just self+Preload+Runtime,
+// subsequent calls are skipped — the scheduler handles incremental updates.
 ensure_linked_files :: (file: *Program_File) {
     if !file return;
 
-    // Always recompute linked_files — the scheduler may have processed this
-    // file before all its "parents" (files that import/load it) were available,
-    // resulting in a sparse linked_files list. Recomputing now picks up any
-    // newly-parsed parent files and their transitive reachable files.
-    // This is safe because: server.files is append-only for parsed files
-    // (existing files are reset+re-parsed, not removed), and get_file_links
-    // iterates the current snapshot.
+    // Skip if already well-linked — scheduler handles the rest incrementally.
+    if file.linked_files.count > 3 return;
+
+    // Quick check: has a loader file appeared since parse_file's seed step?
+    // Uses loads_only=true (no import DFS), much cheaper than full get_file_links.
+    files_that_load := get_files_that_load(file);
+    defer array_free(files_that_load);
+    if files_that_load.count == 0 {
+        log("ENSURE_LINKED_FILES: no loaders yet for % — deferring", file.path);
+        return;
+    }
+
+    // Found loaders — do the expensive full DFS to compute linked_files.
     release(*file.analysis_pool);
 
-    // Find Preload and Runtime_Support (under lock)
     preload_file: *Program_File;
     runtime_support_file: *Program_File;
     {
@@ -1109,8 +1134,10 @@ get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *No
 
             // Protect against concurrent modification by worker threads
             // (workers call parse_file -> node_visit -> table_add(*file.declarations))
+            // Use try_lock: if a worker is actively analyzing this file, skip it
+            // so the completion handler returns fast instead of blocking for seconds.
             if !linked_file.file continue;  // safety: null from concurrent table modification
-            lock(*linked_file.file.mutex);
+            if !try_lock(*linked_file.file.mutex) continue;  // worker has lock → skip, fast return
             // We are searching for specific decl
             if name.count > 0 {
                 for decl: table_find_multiple(*linked_file.file.declarations, name) {
@@ -1194,6 +1221,11 @@ is_global :: (node: *Node, from_file: *Program_File, it_file: *Program_File, fro
         if directive_scope.scope_kind == .MODULE && !from_import return true;
         if directive_scope.scope_kind == .EXPORT return true;
         if directive_scope.scope_kind == .FILE && from_file == it_file return true;
+    }
+
+    // On the right-hand side of `using` — walk up to the scope that contains it.
+    if node.parent.kind == .USING {
+        return is_global(node.parent, from_file, it_file, from_import);
     }
 
     return false;
