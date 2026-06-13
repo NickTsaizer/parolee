@@ -434,9 +434,21 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
 
-            // Full re-parse + incremental analysis (non-blocking, scheduler loop)
-            parse_file(file_path, true);
+            // Shallow re-parse: current file only, imports/loads deferred to workers.
+            // Full deep parse (follow_all=true) would recursively parse hundreds of
+            // transitively imported modules, blocking completions for seconds after save.
+            parse_file(file_path, true, true);
+
+            // Rebuild linked files immediately so completions/goto work right after save.
+            {
+                file := get_file(file_path);
+                if file ensure_linked_files(file);
+            }
+
+            // Trigger background import resolution + analysis (non-blocking).
             finish_analysis_if_complete();
+
+            server.diagnostics_pending = true;
 
         case "textDocument/didOpen";
             success, body := json_parse_string(raw_request, LSP_Did_Open_Text_Document,, temp);
