@@ -727,10 +727,24 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                 } else {
                     node_to_resolve = get_node_type(type_source);
                 }
-                fields := get_type_fields(node_to_resolve);
-                append_inserted_fields_for_decl_exact(*fields, decl);
-                if fields.count > 0 {
-                    return true, fields;
+                // get_node_type can fail for identifiers whose location.file
+                // is empty (parser edge case). Fall back to searching the
+                // current file's declarations by name.
+                if !node_to_resolve && type_source.kind == .IDENTIFIER {
+                    ts_ident := cast(*Identifier) type_source;
+                    if ts_ident.name.count > 0 {
+                        fallback_decls := get_declarations(file, null, null, ts_ident.name);
+                        if fallback_decls.count > 0 {
+                            node_to_resolve = get_node_type(fallback_decls[0]);
+                        }
+                    }
+                }
+                if node_to_resolve {
+                    fields := get_type_fields(node_to_resolve);
+                    append_inserted_fields_for_decl_exact(*fields, decl);
+                    if fields.count > 0 {
+                        return true, fields;
+                    }
                 }
             }
         } else if node.kind == .COMPOUND_DECLARATION {
@@ -777,12 +791,24 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                 } else {
                     node_to_resolve = get_node_type(type_source);
                 }
-                fields := get_type_fields(node_to_resolve);
-                if local_decl.kind == .DECLARATION {
-                    append_inserted_fields_for_decl_exact(*fields, cast(*Declaration) local_decl);
+                // Fallback for identifiers with empty location.file
+                if !node_to_resolve && type_source.kind == .IDENTIFIER {
+                    ts_ident := cast(*Identifier) type_source;
+                    if ts_ident.name.count > 0 {
+                        fallback_decls := get_declarations(file, null, null, ts_ident.name);
+                        if fallback_decls.count > 0 {
+                            node_to_resolve = get_node_type(fallback_decls[0]);
+                        }
+                    }
                 }
-                if fields.count > 0 {
-                    return true, fields;
+                if node_to_resolve {
+                    fields := get_type_fields(node_to_resolve);
+                    if local_decl.kind == .DECLARATION {
+                        append_inserted_fields_for_decl_exact(*fields, cast(*Declaration) local_decl);
+                    }
+                    if fields.count > 0 {
+                        return true, fields;
+                    }
                 }
             }
         }
@@ -908,6 +934,7 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
 
                             if !found_field && _struct.polymorphic_arguments.count > 0 {
                                 for arg, arg_i: _struct.polymorphic_arguments {
+                                    if !arg continue;
                                     param_name := get_polymorphic_param_name(arg);
                                     if param_name.count > 0 && param_name == field_name && arg_i < pc.arguments.count {
                                         field_type = pc.arguments[arg_i];
@@ -940,6 +967,29 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
             }
         }
     }
+
+    // Phase 4 — search linked_files for an imported type/enum/struct.
+    // Phases 1-3 only scan the current file's nodes; if the variable
+    // before the dot is declared in an imported module, its type won't
+    // be found locally. get_declarations with a name filter searches
+    // both the current file and all linked_files.
+    if var_name.count > 0 {
+        linked_decls := get_declarations(file, null, null, var_name);
+        for linked_decls {
+            if !it continue;
+            type_source: *Node = it.type_inst;
+            if !type_source type_source = it.expression;
+            if !type_source continue;
+            resolved := get_node_type(type_source);
+            if !resolved continue;
+            fields := get_type_fields(resolved);
+            if fields.count > 0 {
+                append_inserted_fields_for_decl_exact(*fields, it);
+                return true, fields;
+            }
+        }
+    }
+
     return false, empty;
 }
 
@@ -1202,6 +1252,7 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
 
             // Add polymorphic parameter names as synthetic fields
             for arg: _struct.polymorphic_arguments {
+                if !arg continue;
                 param_name := get_polymorphic_param_name(arg);
                 if param_name.count == 0 continue;
                 synth_decl := New(Declaration);
@@ -1255,6 +1306,7 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
 
                         if _struct.polymorphic_arguments.count > 0 {
                             for arg, arg_i: _struct.polymorphic_arguments {
+                                if !arg continue;
                                 param_name := get_polymorphic_param_name(arg);
                                 if param_name.count > 0 {
                                     synth_decl := New(Declaration);
@@ -1303,6 +1355,7 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
 
                         if _struct.polymorphic_arguments.count > 0 {
                             for arg, arg_i: _struct.polymorphic_arguments {
+                                if !arg continue;
                                 param_name := get_polymorphic_param_name(arg);
                                 if param_name.count > 0 {
                                     synth_decl := New(Declaration);

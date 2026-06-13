@@ -1034,6 +1034,7 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
             _struct := cast(*Struct) node;
 
             for arg: _struct.polymorphic_arguments {
+                if !arg continue;
                 if arg.kind != .DECLARATION continue;
                 decl := cast(*Declaration) arg;
 
@@ -1046,6 +1047,7 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
             _union := cast(*Union) node;
 
             for arg: _union.polymorphic_arguments {
+                if !arg continue;
                 if arg.kind != .DECLARATION continue;
                 decl := cast(*Declaration) arg;
 
@@ -1691,6 +1693,7 @@ unwrap_polymorphic_constant :: (node: *Node) -> *Node {
 // $packages: Type → Polymorphic_Constant(expression=Declaration(name="packages"))
 // $T            → Polymorphic_Constant(expression=Identifier(name="T"))
 get_polymorphic_param_name :: (arg: *Node) -> string {
+    if !arg return "";
     // Polymorphic args in a struct definition (declared as `struct (x: Type)`)
     // are stored as DECLARATION nodes.
     if arg.kind == .DECLARATION {
