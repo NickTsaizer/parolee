@@ -469,6 +469,19 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             // workers progressively enrich server.files with transitive deps.
             parse_file(file_path, true, true);
 
+            // Clear cached linked_files so ensure_linked_files rebuilds from
+            // scratch. Init may have populated linked_files without the loader's
+            // deferred imports (e.g. sgpu) because non-root files are parsed
+            // with follow_all=false during init.
+            {
+                f := get_file(file_path);
+                if f {
+                    lock(*f.mutex);
+                    f.linked_files = .[];
+                    unlock(*f.mutex);
+                }
+            }
+
             // Re-parse loader files shallowly so they populate their loads
             // array fresh. Handles the case where a loaded file's parent
             // (module.jai) was already parsed during init with follow_all=false,
@@ -487,7 +500,26 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
                 unlock(*server.files_mutex);
                 for path: loader_paths {
                     log("Re-parsing loader '%' due to didOpen of '%'", path, file_path);
-                    parse_file(path, false, true, false);  // shallow, no follow_all; force=false avoids race with worker threads
+                    parse_file(path, false, true, false);  // shallow, no follow_all; force=false
+                    
+                    // Defer the loader's bare imports so #loaded files can
+                    // resolve types from transitively imported modules.
+                    // During init, non-root files like module.jai are parsed
+                    // with follow_all=false, skipping bare #import deferral.
+                    // We re-defer them here so they get parsed shallowly.
+                    loader_file := get_file(path);
+                    if loader_file {
+                        lock(*server.deferred_mutex);
+                        saved := context.allocator;
+                        context.allocator = context.default_allocator;
+                        for imp: loader_file.imports {
+                            if imp.root.count > 0 && get_file(imp.root) == null {
+                                array_add_if_unique(*server.deferred_imports, copy_string(imp.root));
+                            }
+                        }
+                        context.allocator = saved;
+                        unlock(*server.deferred_mutex);
+                    }
                     free(path);
                 }
                 array_free(loader_paths);
@@ -502,7 +534,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             module_path := normalize_path(join(module_dir, "/module.jai"));
             if get_file(module_path) == null && file_exists(module_path) {
                 log("DISK_LOADER: parsing module.jai from disk: %", module_path);
-                parse_file(module_path, true, true, false);  // shallow, no follow_all
+                parse_file(module_path, true, true, true);  // shallow, follow_all=true → defer bare imports
             }
 
             // Drain deferred imports shallowly: follows ONE level of loads
