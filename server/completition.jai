@@ -522,6 +522,21 @@ handle_struct_literal_completitions :: (request: LSP_Request_Message_Completion,
             }
             parent = parent.parent;
         }
+
+        // Still no type — try assignment left side (e.g., a = .{})
+        if !type_node {
+            parent = literal_node.parent;
+            while parent {
+                if parent.kind == .BINARY_OPERATION {
+                    op := cast(*Binary_Operation) parent;
+                    if op.operation == .ASSIGN && op.left {
+                        type_node = get_node_type(op.left, true);
+                        break;
+                    }
+                }
+                parent = parent.parent;
+            }
+        }
     }
 
     if !type_node return false;

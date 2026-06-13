@@ -266,6 +266,9 @@ handle_goto :: (request: LSP_Request_Message_Definition) {
         return;
     }
 
+    // Ensure linked_files is populated — same pattern as completions handler.
+    ensure_linked_files(file);
+
     cursor_location := lsp_location_to_node_location(request.params.position, file_path);
 
     cursor_node := get_node_by_location(file, cursor_location);

@@ -568,20 +568,20 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
         // follow_all=true (root file): follow EVERY #import (bare + using).
         // follow_all=false (imported file): only follow wrapped_in_decl —
         // prevents recursive transitive loading (e.g. Basic → #import "POSIX").
-        root_or_wrapped := server.follow_all_imports || wrapped_in_decl || wrapped_in_bare_using;
-        if root_or_wrapped {
-            if server.shallow_parse {
-                // Defer import parsing: collect path for background resolution
-                // Copy using default allocator — current context is pool, freed on re-parse
-                if path.count > 0 {
-                    lock(*server.deferred_mutex);
-                    saved := context.allocator;
-                    context.allocator = context.default_allocator;
-                    array_add_if_unique(*server.deferred_imports, copy_string(path));
-                    context.allocator = saved;
-                    unlock(*server.deferred_mutex);
-                }
-            } else {
+        // Exception: shallow parse (didOpen) always defers all imports so that
+        // #loaded files can resolve types from transitively imported modules.
+        if server.shallow_parse {
+            if path.count > 0 {
+                lock(*server.deferred_mutex);
+                saved := context.allocator;
+                context.allocator = context.default_allocator;
+                array_add_if_unique(*server.deferred_imports, copy_string(path));
+                context.allocator = saved;
+                unlock(*server.deferred_mutex);
+            }
+        } else {
+            root_or_wrapped := server.follow_all_imports || wrapped_in_decl || wrapped_in_bare_using;
+            if root_or_wrapped {
                 if path.count > 0 parse_file(path, false, false, false); // imported → restrict transitive
             }
         }
