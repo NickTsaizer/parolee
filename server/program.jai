@@ -394,6 +394,30 @@ ensure_linked_files :: (file: *Program_File) {
     // Found loaders — do the expensive full DFS to compute linked_files.
     release(*file.analysis_pool);
 
+    // Drain deferred imports so transitive using-imported modules
+    // (e.g. Jay_Math via Jay_Core) are in server.files before building
+    // linked_files. Completions may fire before the scheduler loop
+    // processes deferred imports, leaving transitive modules unparsed.
+    // Iteratively drain until stable — each parse_file call may add
+    // new deferred imports for the freshly parsed file.
+    DEFERRED_DRAIN_MAX :: 5;
+    for drain_pass: 0 .. DEFERRED_DRAIN_MAX - 1 {
+        lock(*server.deferred_mutex);
+        pending: [..]string;
+        pending.allocator = context.default_allocator;
+        for defer_path: server.deferred_imports {
+            array_add(*pending, copy_string(defer_path));
+        }
+        array_reset(*server.deferred_imports);
+        unlock(*server.deferred_mutex);
+        if pending.count == 0 break;
+        for defer_path: pending {
+            parse_file(defer_path, true, true, false); // force=true, shallow, follow_all=false
+            free(defer_path);
+        }
+        array_free(pending);
+    }
+
     preload_file: *Program_File;
     runtime_support_file: *Program_File;
     {
@@ -556,12 +580,25 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
         wrapped_in_decl := parent && parent.kind == .DECLARATION;
         wrapped_in_bare_using := parent && parent.kind == .USING;
 
+        // Detect `using X :: #import "Y"`: parent is DECLARATION whose
+        // parent is USING. The USING handler (below) also detects this,
+        // but the DIRECTIVE_IMPORT is visited first (depth-first) and
+        // this ensures is_using is set correctly regardless of visit order.
+        wrapped_in_using_namespace := false;
+        if !wrapped_in_bare_using && parent && parent.kind == .DECLARATION && parent.parent && parent.parent.kind == .USING {
+            wrapped_in_using_namespace = true;
+        }
+
         module_import: Module_Import;
         module_import.root = path;
         module_import.module = _import.module;
-        module_import.is_using = wrapped_in_bare_using;
+        module_import.is_using = wrapped_in_bare_using || wrapped_in_using_namespace;
 
-        if !wrapped_in_decl {
+        // Add to imports unless wrapped in a bare decl (X :: #import "Y" without using).
+        // using-namespace imports ARE added here (is_using=true) even though
+        // wrapped_in_decl=true — the USING handler will add a duplicate, but
+        // duplicates are harmless; is_avaiable_from_impl finds the first match.
+        if !wrapped_in_decl || wrapped_in_using_namespace {
             array_add(*data.file.imports, module_import);
         }
 
@@ -1260,14 +1297,14 @@ get_files_that_load :: (target_file: *Program_File) -> []*Program_File {
     return files;
 }
 
-is_avaiable_from :: (file: *Program_File, path: string, $loads_only := false, $max_import_depth : s32 = 1) -> bool, bool {
+is_avaiable_from :: (file: *Program_File, path: string, $loads_only := false, $max_import_depth : s32 = 3) -> bool, bool {
     already_checked: [..]string;
     loaded, from_import := is_avaiable_from_impl(file, path, *already_checked, loads_only, max_import_depth);
     array_free(already_checked);
     return loaded, from_import;
 }
 
-is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[..]string, $loads_only := false, max_import_depth: s32 = 0) -> bool, bool {
+is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[..]string, $loads_only := false, max_import_depth: s32 = 0, in_using_context := false) -> bool, bool {
     from_import: bool;
     loaded: bool;
 
@@ -1277,28 +1314,34 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
             array_add(already_checked, it.root);
 
             if it.root == path {
-                // Direct import: the current file directly imports the target.
-                // #scope_module declarations in directly-imported files should
-                // be visible because the importing file joins the module scope.
-                from_import = false;
-                loaded = true;
-                break;
+                // Accept direct imports (in_using_context=false) or using
+                // imports (it.is_using=true). Skip non-using transitive
+                // imports entirely — they don't push visibility up and
+                // pollute linked_files, blowing past MAX_COMPLETIONS.
+                if !in_using_context || it.is_using {
+                    from_import = false;
+                    loaded = true;
+                    break;
+                }
+                continue;
             }
 
             // Only recurse into transitive imports if max_import_depth > 1.
             // Default max_import_depth=1 means only direct imports are visible.
+            // At transitive levels (in_using_context=true), only follow
+            // `using` imports — non-using ones don't push visibility up
+            // and traversing them (e.g. Basic's 200+ modules) is O(n^2) waste.
             if max_import_depth <= 1 continue;
+            if in_using_context && !it.is_using continue;
 
             next_file := get_file(it.root);
             if !next_file continue;
 
-            found, child_from_import := is_avaiable_from_impl(next_file, path, already_checked, false, max_import_depth - 1);
+            // Any recursion enters a "transitive" context where only
+            // `using` imports are visible — regular imports don't push up.
+            found, child_from_import := is_avaiable_from_impl(next_file, path, already_checked, false, max_import_depth - 1, true); // in_using_context
 
             if found {
-                // Use child's from_import: if the child found the target through
-                // its own loads (from_import=false), propagate that up. Only
-                // set from_import=true when the child itself found it through
-                // an import chain, meaning we have 2+ import hops from origin.
                 from_import = child_from_import;
                 loaded = true;
                 break;
@@ -1319,7 +1362,9 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
         }
 
         next_file := get_file(load_relative_path);
-        if next_file && is_avaiable_from_impl(next_file, path, already_checked, loads_only) {
+        // Propagate in_using_context through loads — loaded files share
+        // the same module scope, so the visibility context is preserved.
+        if next_file && is_avaiable_from_impl(next_file, path, already_checked, loads_only, max_import_depth, in_using_context) {
             loaded = true;
             break;
         }
