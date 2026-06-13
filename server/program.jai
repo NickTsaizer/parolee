@@ -568,20 +568,20 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
         // follow_all=true (root file): follow EVERY #import (bare + using).
         // follow_all=false (imported file): only follow wrapped_in_decl —
         // prevents recursive transitive loading (e.g. Basic → #import "POSIX").
-        // Exception: shallow parse (didOpen) always defers all imports so that
-        // #loaded files can resolve types from transitively imported modules.
-        if server.shallow_parse {
-            if path.count > 0 {
-                lock(*server.deferred_mutex);
-                saved := context.allocator;
-                context.allocator = context.default_allocator;
-                array_add_if_unique(*server.deferred_imports, copy_string(path));
-                context.allocator = saved;
-                unlock(*server.deferred_mutex);
-            }
-        } else {
-            root_or_wrapped := server.follow_all_imports || wrapped_in_decl || wrapped_in_bare_using;
-            if root_or_wrapped {
+        root_or_wrapped := server.follow_all_imports || wrapped_in_decl || wrapped_in_bare_using;
+        if root_or_wrapped {
+            if server.shallow_parse {
+                // Defer import parsing: collect path for background resolution
+                // Copy using default allocator — current context is pool, freed on re-parse
+                if path.count > 0 {
+                    lock(*server.deferred_mutex);
+                    saved := context.allocator;
+                    context.allocator = context.default_allocator;
+                    array_add_if_unique(*server.deferred_imports, copy_string(path));
+                    context.allocator = saved;
+                    unlock(*server.deferred_mutex);
+                }
+            } else {
                 if path.count > 0 parse_file(path, false, false, false); // imported → restrict transitive
             }
         }
@@ -1260,14 +1260,14 @@ get_files_that_load :: (target_file: *Program_File) -> []*Program_File {
     return files;
 }
 
-is_avaiable_from :: (file: *Program_File, path: string, $loads_only := false) -> bool, bool {
+is_avaiable_from :: (file: *Program_File, path: string, $loads_only := false, $max_import_depth : s32 = 1) -> bool, bool {
     already_checked: [..]string;
-    loaded, from_import := is_avaiable_from_impl(file, path, *already_checked, loads_only);
+    loaded, from_import := is_avaiable_from_impl(file, path, *already_checked, loads_only, max_import_depth);
     array_free(already_checked);
     return loaded, from_import;
 }
 
-is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[..]string, $loads_only := false) -> bool, bool {
+is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[..]string, $loads_only := false, max_import_depth: s32 = 0) -> bool, bool {
     from_import: bool;
     loaded: bool;
 
@@ -1285,10 +1285,14 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
                 break;
             }
 
+            // Only recurse into transitive imports if max_import_depth > 1.
+            // Default max_import_depth=1 means only direct imports are visible.
+            if max_import_depth <= 1 continue;
+
             next_file := get_file(it.root);
             if !next_file continue;
 
-            found, child_from_import := is_avaiable_from_impl(next_file, path, already_checked, false);
+            found, child_from_import := is_avaiable_from_impl(next_file, path, already_checked, false, max_import_depth - 1);
 
             if found {
                 // Use child's from_import: if the child found the target through
