@@ -2,8 +2,6 @@
 
 Fork of [SogoCZE/Jails](https://github.com/SogoCZE/Jails). The reason this fork exists is my need to store this somewhere, but I do not want to PR vibecoded pieces of code I never checked.
 
-Maybe sometime I polish and PR this, but not now. That's why this code is parolee.
-
 Upstream Jails is an experimental language server for the Jai programming language.
 This fork focuses on stability fixes, crash prevention, and incremental performance improvements — all produced via vibecoding.
 
