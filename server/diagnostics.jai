@@ -224,6 +224,10 @@ run_diagnostics :: () {
 
     reset_diagnostics();
 
+    // Mark project as clean — any future didChange/didOpen will set this
+    // back to true, signaling that diagnostics should run on the next save.
+    server.files_changed_since_diagnostics = false;
+
     // Capture both stdout and stderr — struct dump may be in either
     result, output, error := run_command(..command, working_directory=server.project_root, capture_and_return_output=true, timeout_ms=2500);
 

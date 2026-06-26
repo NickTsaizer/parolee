@@ -18,7 +18,18 @@ Program_File :: struct {
     ast_pool: Pool;
     analysis_pool: Pool;
 
+    content_hash: u64;   // djb2 hash of last-parsed content; skip re-parse if unchanged
+
     mutex: Mutex;  // guards declarations + nodes during concurrent worker access
+}
+
+// Fast djb2 hash over raw bytes. Used to skip re-parsing when content hasn't changed.
+content_hash :: (data: []u8) -> u64 {
+    hash: u64 = 5381;
+    for byte: data {
+        hash = ((hash << 5) + hash) + cast(u64) byte;
+    }
+    return hash;
 }
 
 // Non-blocking mutex lock attempt.
@@ -232,29 +243,8 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
     path := normalize_path(input_path);
     context.allocator = saved_allocator_for_path;
 
-    // Thread-safe find-or-create: protect server.files lookup + add with mutex
-    lock(*server.files_mutex);
-    ok, file := table_find(*server.files, path);
-    if !force && ok {
-        unlock(*server.files_mutex);
-        // log("Skipping % because it already exists", path);
-        return;
-    }
-    if ok {
-        reset_file(file); // clear old data
-        unlock(*server.files_mutex);
-    } else {
-        file = New(Program_File);
-        file.path = copy_string(path);
-        set_allocators(*file.ast_pool, context.default_allocator);
-        set_allocators(*file.analysis_pool, context.default_allocator);
-        init(*file.mutex);
-        table_add(*server.files, file.path, file);
-        unlock(*server.files_mutex);
-    }
-
-    // log("Parse file: %", path);
-
+    // Load content before acquiring files_mutex so we can hash-check
+    // and skip re-parse without destroying existing AST data in reset_file.
     content := cast(string) get_memory_file(path);
     content_from_file: bool;
 
@@ -275,6 +265,45 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
 
         content_from_file = true;
     }
+
+    // Thread-safe find-or-create with content hash cache
+    lock(*server.files_mutex);
+    ok, file := table_find(*server.files, path);
+    if !force && ok {
+        unlock(*server.files_mutex);
+        if content_from_file free(content);
+        return;
+    }
+    if ok {
+        // Content hash cache: skip re-parse if content unchanged since last parse.
+        // Common case: didSave fires after didChange already parsed identical content.
+        if file.content_hash != 0 {
+            hash := content_hash(cast([]u8) content);
+            if hash == file.content_hash {
+                // Still queue for re-analysis — linked_files may need
+                // rebuilding (e.g. didOpen clears it, or imports changed).
+                lock(*server.files_mutex);
+                array_add_if_unique(*server.files_to_be_analyzed, file);
+                unlock(*server.files_mutex);
+                unlock(*server.files_mutex);  // from outer lock
+                if content_from_file free(content);
+                log("CACHE HIT: skipping re-parse of % (content unchanged)", path);
+                return;
+            }
+        }
+        reset_file(file); // clear old data
+        unlock(*server.files_mutex);
+    } else {
+        file = New(Program_File);
+        file.path = copy_string(path);
+        set_allocators(*file.ast_pool, context.default_allocator);
+        set_allocators(*file.analysis_pool, context.default_allocator);
+        init(*file.mutex);
+        table_add(*server.files, file.path, file);
+        unlock(*server.files_mutex);
+    }
+
+    // log("Parse file: %", path);
 
     path_without_filename := trim_right(path_strip_filename(file.path), "/");
 
@@ -298,6 +327,7 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
         file.comments = parser.lexer.comments;
     }
 
+    file.content_hash = content_hash(cast([]u8) content);
     if content_from_file free(content);
     // log("Parsed: % (nodes: %, declarations: %, pointer: %)", path, file.nodes.count, file.declarations.count, file);
 
@@ -458,73 +488,97 @@ ensure_linked_files :: (file: *Program_File) {
     unlock(*server.files_mutex);
 }
 
-// Incremental analysis: process ONE file per call from the scheduler loop.
-// Returns false when all files in files_to_be_analyzed are done (and sends
-// "Indexing complete" progress message).
-// This prevents blocking the main thread for seconds during get_file_links
-// when the import tree has hundreds of files.
+
+// Background analysis thread: runs get_file_links for all files in
+// files_to_be_analyzed. Runs in a separate thread so the main I/O loop
+// stays responsive to completions, diagnostics, and other LSP requests.
+// Signals the main thread via done_pipe when complete.
+
+analysis_thread_proc :: (thread: *Thread) -> s64 {
+    context.logger = lsp_log;
+
+    // Snapshot preload/runtime pointers (stable during analysis)
+    preload: *Program_File;
+    runtime: *Program_File;
+    for f: server.files {
+        if !runtime && f && contains(f.path, "Runtime_Support.jai") runtime = f;
+        if !preload && f && contains(f.path, "Preload.jai") preload = f;
+    }
+
+    // Copy file list under lock, reset for next batch
+    files: [..]*Program_File;
+    files.allocator = context.default_allocator;
+    lock(*server.files_mutex);
+    for f: server.files_to_be_analyzed {
+        array_add(*files, f);
+    }
+    array_reset(*server.files_to_be_analyzed);
+    unlock(*server.files_mutex);
+
+    log("Analysis thread: processing % files", files.count);
+
+    for file: files {
+        if !file continue;
+        release(*file.analysis_pool);
+        linked_files := get_file_links(file,, pool_alloc(*file.analysis_pool));
+        if file != preload && preload {
+            array_add(*linked_files, .{ file=preload, from_import=true });
+        }
+        if file != runtime && runtime {
+            array_add(*linked_files, .{ file=runtime, from_import=true });
+        }
+        lock(*file.mutex);
+        file.linked_files = linked_files;
+        unlock(*file.mutex);
+        log("Analysis thread: rebuilt linked_files for % → % files", file.path, linked_files.count);
+        reset_temporary_storage();
+    }
+
+    array_free(files);
+
+    server.preload_file = null;
+    server.runtime_support_file = null;
+    send_progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
+    log("Background analysis complete");
+    server.analysis_pending = false;
+
+    // Wake main thread
+    sig: u8 = 0;
+    write(cast(s32) server.done_pipe_w, *sig, 1);
+
+    return 0;
+}
+
 process_analysis_step :: () -> bool {
     if !server.analysis_pending {
-        // First call — discover the batch
-        for f: server.files_to_be_analyzed {
-            release(*f.analysis_pool);
+        if server.files_to_be_analyzed.count == 0 {
+            send_progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
+            log("Background analysis complete");
+            return false;
         }
+
+        server.analysis_pending = true;
 
         server.preload_file = null;
         server.runtime_support_file = null;
         for f: server.files {
-            if !server.runtime_support_file && contains(f.path, "Runtime_Support.jai") {
+            if !server.runtime_support_file && f && contains(f.path, "Runtime_Support.jai") {
                 server.runtime_support_file = f;
             }
-            if !server.preload_file && contains(f.path, "Preload.jai") {
+            if !server.preload_file && f && contains(f.path, "Preload.jai") {
                 server.preload_file = f;
             }
         }
 
-        server.analysis_index = 0;
-        server.analysis_pending = true;
+        thread := New(Thread);
+        thread_init(thread, analysis_thread_proc);
+        thread_start(thread);
+
+        return true;
     }
 
-    if server.analysis_index >= server.files_to_be_analyzed.count {
-        // All done
-        array_reset(*server.files_to_be_analyzed);
-        server.analysis_pending = false;
-        server.analysis_index = -1;
-        server.preload_file = null;
-        server.runtime_support_file = null;
-        send_progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
-        log("Background analysis complete");
-        return false;
-    }
-
-    file := server.files_to_be_analyzed[server.analysis_index];
-    server.analysis_index += 1;
-
-    linked_files := get_file_links(file,, pool_alloc(*file.analysis_pool));
-
-    if file != server.preload_file && server.preload_file {
-        array_add(*linked_files, .{ file=server.preload_file, from_import=true });
-    }
-
-    if file != server.runtime_support_file && server.runtime_support_file {
-        array_add(*linked_files, .{ file=server.runtime_support_file, from_import=true });
-    }
-
-    file.linked_files = linked_files;
-
-    // Check if this was the last one
-    if server.analysis_index >= server.files_to_be_analyzed.count {
-        array_reset(*server.files_to_be_analyzed);
-        server.analysis_pending = false;
-        server.analysis_index = -1;
-        server.preload_file = null;
-        server.runtime_support_file = null;
-        send_progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
-        log("Background analysis complete");
-        return false;
-    }
-
-    return true; // more files remain
+    // Analysis running in background thread
+    return true;
 }
 
 Node_Visit_Data :: struct {

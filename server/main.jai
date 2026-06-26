@@ -36,6 +36,7 @@ Server :: struct {
     deferred_processed: int;
     needs_reanalyze: bool;
     diagnostics_pending: bool;   // run diagnostics after message response sent
+    files_changed_since_diagnostics: bool;  // skip diagnostics on save if no files changed
     token_busy: bool;            // rate-limit: skip if semantic tokens already processing
     progress_cycle: int;         // unique token per batch progress cycle
     skip_reanalyze: bool;        // init: skip get_files_that_use (O(n²) overhead, no existing files need reanalysis)
@@ -430,9 +431,31 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
                 return;
             }
 
-            server.diagnostics_pending = true;
-
             file_path := normalize_path(body.params.textDocument.uri,, temp);
+
+            // Content hash cache: skip re-parse + linked-file rebuild + analysis
+            // if content unchanged since last parse.
+            {
+                file := get_file(file_path);
+                if file && file.content_hash != 0 {
+                    content := get_memory_file(file_path);
+                    if content.count > 0 {
+                        hash := content_hash(content);
+                        if hash == file.content_hash {
+                            // Content unchanged — skip re-parse but trigger
+                            // background linked_files rebuild so completions
+                            // don't pay the ensure_linked_files cost later.
+                            finish_analysis_if_complete();
+                            if server.files_changed_since_diagnostics {
+                                server.diagnostics_pending = true;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            server.diagnostics_pending = true;
 
             // Shallow re-parse: current file only, imports/loads deferred to workers.
             // Full deep parse (follow_all=true) would recursively parse hundreds of
@@ -560,6 +583,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             // Run diagnostics after initial indexing so compiler-harvested
             // #insert/#bake_arguments completions are available without an
             // initial manual save. Scheduler waits for import workers to idle.
+            server.files_changed_since_diagnostics = true;
             server.diagnostics_pending = true;
 
             log("File_path: %", file_path);
@@ -577,6 +601,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             // handles incremental link resolution one file at a time.
             parse_file(file_path, true);
             finish_analysis_if_complete();
+            server.files_changed_since_diagnostics = true;
 
         case "textDocument/documentSymbol";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Document_Symbol);
@@ -716,11 +741,6 @@ finish_analysis_if_complete :: () {
     remaining := server.deferred_imports.count;
     unlock(*server.deferred_mutex);
     if !server.needs_reanalyze || remaining > 0 return;
-
-    lock(*server.task_queue_mutex);
-    idle := server.busy_workers == 0;
-    unlock(*server.task_queue_mutex);
-    if !idle return;
 
     server.needs_reanalyze = false;
     server.deferred_total = 0;
@@ -1115,30 +1135,24 @@ main :: () {
         // Check analysis complete (requires busy_workers == 0)
         finish_analysis_if_complete();
 
-        // Incremental analysis: process files one-at-a-time, checking I/O
-        // between each. This prevents blocking the main thread for seconds
-        // when get_file_links iterates hundreds of server.files entries.
-        while server.analysis_pending {
-            process_analysis_step();
+        // Background analysis: thread handles get_file_links DFS.
+        // Main loop just flushes output and checks I/O while thread works.
+        if server.analysis_pending {
             flush_output_queue();
             if io_wait(0) {
                 drain_io_queue();
                 flush_output_queue();
             }
-            if server.quit break;
         }
 
         flush_output_queue();
 
-        // Run pending diagnostics when idle
+        // Run pending diagnostics when needed.
+        // Compiler runs as separate process — safe to run even when
+        // workers are busy parsing imports.
         if server.diagnostics_pending {
-            lock(*server.task_queue_mutex);
-            idle := server.busy_workers == 0;
-            unlock(*server.task_queue_mutex);
-            if idle {
-                server.diagnostics_pending = false;
-                run_diagnostics();
-            }
+            server.diagnostics_pending = false;
+            run_diagnostics();
         }
 
     }
