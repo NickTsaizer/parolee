@@ -1,4 +1,4 @@
-VERSION :: "1.0.0";
+VERSION :: "0.2.22";
 
 MEMORY_DEBUG :: false;
 
@@ -335,6 +335,8 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             server.quit = true;
             lsp_respond(request.id, null);
         case "initialize";
+            log("Jails version: %", VERSION);
+
             success, body := json_parse_string(raw_request, LSP_Request_Message_Initialize,, temp);
             if !success {
                 log_error("Unable to parse initialize message");
@@ -414,6 +416,8 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             log("INIT: respond...");
             to_send: LSP_Result_Initialize;
             lsp_respond(body.id, to_send);
+
+            run_diagnostics();
 
         case "textDocument/definition";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Definition,, temp);

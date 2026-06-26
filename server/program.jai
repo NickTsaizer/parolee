@@ -1,13 +1,19 @@
 Module_Import :: struct {
     module: string;
     root: string;
+    target: *Program_File;
     is_using: bool;
+}
+
+Resolved_Load :: struct {
+    resolved_path: string;
+    target: *Program_File;
 }
 
 Program_File :: struct {
     path: string;
     imports: [..]Module_Import;
-    loads: [..]*Directive_Load;
+    loads: [..]Resolved_Load;
     nodes: [..]*Node;
     global_block: Block;
     declarations: Table(string, *Declaration);
@@ -127,13 +133,15 @@ deinit_inserted_fields :: () {
     deinit(*server.decl_type_ids);
 }
 
-reset_file :: (using file: Program_File) {
+reset_file :: (using file: *Program_File) {
     lock(*file.mutex);
     table_reset(*declarations);
     array_reset(*nodes);
     array_reset(*loads);
     array_reset(*imports);
     array_reset(*comments);
+    global_block.members.data = null;
+    global_block.members.count = 0;
     release(*file.ast_pool);
     unlock(*file.mutex);
 }
@@ -222,7 +230,7 @@ pool_alloc :: (pool: *Pool) -> Allocator {
 
 parse_file :: (input_path: string, force := false, shallow := false, follow_all := true) {
     // Reset back to default allocator, we dont want to use pool from "parent" file...
-    context.allocator = context.default_allocator;
+    push_allocator(context.default_allocator);
 
     // Thread-safe shallow flag: each caller passes its own value.
     // No global state mutation — node_visit reads server.shallow_parse
@@ -361,10 +369,24 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
 
 // Full analysis: processes all files in files_to_be_analyzed at once.
 // Used from initialize/didSave/didChange where the batch is small.
+
+resolve_file_graph :: () {
+    for file: server.files {
+        for *imp: file.imports {
+            imp.target = get_file(imp.root);
+        }
+        for *load: file.loads {
+            load.target = get_file(load.resolved_path);
+        }
+    }
+}
+
 analyze_files :: () {
     for file: server.files_to_be_analyzed {
         release(*file.analysis_pool);
     }
+
+    resolve_file_graph();
 
     preload_file: *Program_File;
     runtime_support_file: *Program_File;
@@ -392,10 +414,6 @@ analyze_files :: () {
 
         file.linked_files = linked_files;
     }
-
-    // for file: server.files_to_be_analyzed {
-    //     resolve_identifiers(file, global_only=true,, pool_alloc(*file.analysis_pool));
-    // }
 
     array_reset(*server.files_to_be_analyzed);
 }
@@ -700,8 +718,8 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
     if node.kind == .DIRECTIVE_LOAD {
         _load := cast(*Directive_Load) node;
 
-        load_relative_path := join(data.path_without_filename, _load.file, separator="/");
-        array_add(*data.file.loads, _load);
+        load_relative_path := normalize_path(join(data.path_without_filename, _load.file, separator="/"));
+        array_add(*data.file.loads, Resolved_Load.{ resolved_path=load_relative_path });
         if server.shallow_parse {
             lock(*server.deferred_mutex);
             saved := context.allocator;
@@ -856,15 +874,13 @@ get_file_links :: (file: *Program_File) -> [..]Linked_File {
     defer array_free(files_that_load_this_file);
 
     for server.files {
-        // This ensure we take into account only files that are being loaded or imported...
         from_import: bool;
 
-        if file.path != it.path {
+        if file != it {
             is_avaiable_from_one_of_the_parents: bool;
 
             for file_that_load_this_file: files_that_load_this_file {
-
-                if file_that_load_this_file.path == it.path {
+                if file_that_load_this_file == it {
                     is_avaiable_from_one_of_the_parents = true;
                     break;
                 }
@@ -1366,10 +1382,13 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
 
     #if !loads_only {
         for file.imports {
-            if array_find(already_checked.*, it.root) continue;
-            array_add(already_checked, it.root);
+            target_path := it.root;
+            if target_path.count == 0 && it.target target_path = it.target.path;
+            if target_path.count == 0 continue;
+            if array_find(already_checked.*, target_path) continue;
+            array_add(already_checked, target_path);
 
-            if it.root == path {
+            if target_path == path {
                 // Accept direct imports (in_using_context=false) or using
                 // imports (it.is_using=true). Skip non-using transitive
                 // imports entirely — they don't push visibility up and
@@ -1390,7 +1409,8 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
             if max_import_depth <= 1 continue;
             if in_using_context && !it.is_using continue;
 
-            next_file := get_file(it.root);
+            next_file := it.target;
+            if !next_file next_file = get_file(target_path);
             if !next_file continue;
 
             // Any recursion enters a "transitive" context where only
@@ -1406,18 +1426,20 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
     }
 
     for file.loads {
-        load_path := trim_right(path_strip_filename(file.path), "/");
-        load_relative_path := normalize_path(join(load_path, "/", it.file));
-
-        if array_find(already_checked.*, load_relative_path) continue;
-        array_add(already_checked, load_relative_path);
+        load_relative_path := it.resolved_path;
+        if load_relative_path.count == 0 && it.target load_relative_path = it.target.path;
+        if load_relative_path.count == 0 continue;
 
         if load_relative_path == path {
             loaded = true;
             break;
         }
 
-        next_file := get_file(load_relative_path);
+        if array_find(already_checked.*, load_relative_path) continue;
+        array_add(already_checked, load_relative_path);
+
+        next_file := it.target;
+        if !next_file next_file = get_file(load_relative_path);
         // Propagate in_using_context through loads — loaded files share
         // the same module scope, so the visibility context is preserved.
         if next_file && is_avaiable_from_impl(next_file, path, already_checked, loads_only, max_import_depth, in_using_context) {
@@ -2112,7 +2134,7 @@ get_dot_path :: (binary_op: *Binary_Operation, from: *Node) -> []*Node {
             return path;
         }
     }
-    
+
     current_op: *Binary_Operation = root_binary_op;
     while current_op.parent && current_op.parent.kind == .BINARY_OPERATION {
         current_op = cast(*Binary_Operation, current_op.parent);
@@ -2123,7 +2145,7 @@ get_dot_path :: (binary_op: *Binary_Operation, from: *Node) -> []*Node {
 
         if current_op.left array_add(*path, current_op.left);
     }
-    
+
     array_reverse(path);
 
     return path;
@@ -2553,7 +2575,7 @@ compound_declaration_to_declarations :: (decls: *[..]*Declaration, comp_decl: *C
 
                 if proc_node.kind == .PROCEDURE {
                     proc := cast(*Procedure) proc_node;
-                    
+
                     if it_index < proc.returns.count {
                         item_expr = proc.returns[it_index];
                     }
