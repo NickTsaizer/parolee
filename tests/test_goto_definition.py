@@ -94,7 +94,12 @@ def check(session: Any, line: int, character: int, want_suffix: str, want_line: 
         },
     )
     assert "error" not in resp, f"definition failed: {resp.get('error')}"
-    uri, got_line = target_of(resp.get("result"))
+    raw = resp.get("result")
+    # Regression: same-file targets must not duplicate (self-link bug
+    # returned every global twice). All cases below resolve in main.jai.
+    if isinstance(raw, list):
+        assert len(raw) == 1, f"duplicate goto targets: {raw}"
+    uri, got_line = target_of(raw)
     assert uri.endswith(want_suffix), f"want *{want_suffix}, got {uri}"
     assert got_line == want_line, f"want line {want_line}, got {got_line}"
 

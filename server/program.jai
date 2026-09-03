@@ -875,28 +875,31 @@ get_file_links :: (file: *Program_File) -> [..]Linked_File {
     defer array_free(files_that_load_this_file);
 
     for server.files {
+        // Own declarations are added separately in get_declarations;
+        // linking self would return every global twice (duplicate
+        // goto targets and completion items).
+        if file == it continue;
+
         from_import: bool;
 
-        if file != it {
-            is_avaiable_from_one_of_the_parents: bool;
+        is_avaiable_from_one_of_the_parents: bool;
 
-            for file_that_load_this_file: files_that_load_this_file {
-                if file_that_load_this_file == it {
-                    is_avaiable_from_one_of_the_parents = true;
-                    break;
-                }
-
-                avaiable, from_import= := is_avaiable_from(file_that_load_this_file, it);
-                if !avaiable continue;
-
+        for file_that_load_this_file: files_that_load_this_file {
+            if file_that_load_this_file == it {
                 is_avaiable_from_one_of_the_parents = true;
                 break;
             }
 
-            if !is_avaiable_from_one_of_the_parents {
-                avaiable, from_import= := is_avaiable_from(file, it);
-                if !avaiable continue;
-            }
+            avaiable, from_import= := is_avaiable_from(file_that_load_this_file, it);
+            if !avaiable continue;
+
+            is_avaiable_from_one_of_the_parents = true;
+            break;
+        }
+
+        if !is_avaiable_from_one_of_the_parents {
+            avaiable, from_import= := is_avaiable_from(file, it);
+            if !avaiable continue;
         }
 
         array_add(*linked_files, .{ file=it, from_import=from_import });
