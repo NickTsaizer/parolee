@@ -557,9 +557,11 @@ analysis_thread_proc :: (thread: *Thread) -> s64 {
     log("Background analysis complete");
     server.analysis_pending = false;
 
-    // Wake main thread
-    sig: u8 = 0;
-    write(cast(s32) server.done_pipe_w, *sig, 1);
+    // NOTE: no done_pipe write here. done_pipe bytes are 1:1 task
+    // accounting with busy_workers (push_task/drain_completions); the
+    // analysis thread owns no task slot, so writing would underflow
+    // busy_workers and wedge workers_idle forever. Main loop polls the
+    // pipe with idle timeout and observes analysis_pending directly.
 
     return 0;
 }
@@ -1392,8 +1394,11 @@ is_avaiable_from_impl :: (file: *Program_File, target: *Program_File, already_ch
                 // imports (it.is_using=true). Skip non-using transitive
                 // imports entirely — they don't push visibility up and
                 // pollute linked_files, blowing past MAX_COMPLETIONS.
+                // from_import=true marks #import reachability so is_global
+                // hides #scope_module decls from importers (#load reachability
+                // keeps from_import=false and shares module scope).
                 if !in_using_context || it.is_using {
-                    from_import = false;
+                    from_import = true;
                     loaded = true;
                     break;
                 }

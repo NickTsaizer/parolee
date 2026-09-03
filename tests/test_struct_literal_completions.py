@@ -14,6 +14,22 @@ import sys
 import tempfile
 import time
 from typing import Any
+def _load_lsp_client():
+    """Load sibling lsp_client.py by path (cwd-independent)."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "lsp_client.py"
+    spec = importlib.util.spec_from_file_location("lsp_client", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_lsp_client = _load_lsp_client()
+JsonRpcClient = _lsp_client.JsonRpcClient
+detect_jai_root = _lsp_client.detect_jai_root
+file_uri = _lsp_client.file_uri
 
 
 MAIN_SOURCE = """\
@@ -44,93 +60,6 @@ CURSOR1_CHAR = 8
 # Cursor for test 2: empty line inside dotless .{ ... }
 CURSOR2_LINE = 15
 CURSOR2_CHAR = 8
-
-
-# -- JSON-RPC client ----------------------------------------------------------
-
-
-class JsonRpcClient:
-    def __init__(self, process: subprocess.Popen[bytes]) -> None:
-        self.process = process
-
-    def send(self, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        assert self.process.stdin is not None
-        self.process.stdin.write(header + body)
-        self.process.stdin.flush()
-
-    def _read_exact(self, n: int, timeout_s: float) -> bytes:
-        assert self.process.stdout is not None
-        fd = self.process.stdout.fileno()
-        data = bytearray()
-        deadline = time.time() + timeout_s
-        while len(data) < n:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise TimeoutError(f"Timed out waiting for {n} bytes")
-            ready, _, _ = select.select([fd], [], [], remaining)
-            if not ready:
-                continue
-            chunk = os.read(fd, n - len(data))
-            if not chunk:
-                raise RuntimeError("LSP process closed stdout unexpectedly")
-            data.extend(chunk)
-        return bytes(data)
-
-    def read_message(self, timeout_s: float = 10.0) -> dict[str, Any]:
-        header_bytes = bytearray()
-        while b"\r\n\r\n" not in header_bytes:
-            header_bytes.extend(self._read_exact(1, timeout_s))
-
-        header_blob, _, _ = bytes(header_bytes).partition(b"\r\n\r\n")
-        content_length = None
-        for line in header_blob.decode("ascii").split("\r\n"):
-            if not line:
-                continue
-            key, _, value = line.partition(":")
-            if key.lower() == "content-length":
-                content_length = int(value.strip())
-                break
-
-        if content_length is None:
-            raise RuntimeError(f"No Content-Length in header: {header_blob!r}")
-
-        body = self._read_exact(content_length, timeout_s)
-        return json.loads(body.decode("utf-8"))
-
-    def wait_for_response(
-        self, request_id: int, timeout_s: float = 10.0
-    ) -> dict[str, Any]:
-        deadline = time.time() + timeout_s
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise TimeoutError(f"Timed out waiting for response id={request_id}")
-            message = self.read_message(remaining)
-            if message.get("id") == request_id:
-                return message
-
-
-# -- Helpers ------------------------------------------------------------------
-
-
-def detect_jai_root() -> str | None:
-    for exe_name in ("jai-linux", "jai", "jai-macos", "jai.exe"):
-        path = shutil.which(exe_name)
-        if not path:
-            continue
-        resolved = Path(path).resolve()
-        if resolved.parent.name == "bin":
-            return str(resolved.parent.parent)
-    return None
-
-
-def file_uri(path: Path) -> str:
-    return path.resolve().as_uri()
-
-
-# -- Test body ----------------------------------------------------------------
 
 
 def main() -> int:

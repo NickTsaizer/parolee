@@ -1597,17 +1597,17 @@ get_comment_before_decl :: (file: *Program_File, decl: *Declaration) -> string {
     collected: [..]string;
     defer array_free(collected);
 
-    // Expected line where the comment's last content line should be:
-    // Jai lexer sets l1 to line AFTER consuming newline, so effective last line is l1 - 1.
+    // Expected line where the comment's last content line should be.
+    // Lexer leaves l1/c1 at the newline (single-line) or closing /
+    // (multi-line), so l1 is the effective last content line.
     expect_line := decl_line - 1;
     i := file.comments.count - 1;
     while i >= 0 {
         comment := file.comments[i];
         i -= 1;
 
-        // comment.l1 is the line after the newline was consumed
-        // effective last line of content = l1 - 1
-        comment_last_line := comment.l1 - 1;
+        // l1 is the last content line of the comment.
+        comment_last_line := comment.l1;
 
         // Skip comments that end on or after the declaration line
         if comment_last_line >= decl_line continue;

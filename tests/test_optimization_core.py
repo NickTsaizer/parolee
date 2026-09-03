@@ -20,6 +20,21 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+def _load_lsp_client():
+    """Load sibling lsp_client.py by path (cwd-independent)."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "lsp_client.py"
+    spec = importlib.util.spec_from_file_location("lsp_client", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_lsp_client = _load_lsp_client()
+JsonRpcClient = _lsp_client.JsonRpcClient
+find_jails_binary = _lsp_client.find_jails_binary
 
 
 # -- Jai test source -----------------------------------------------------------
@@ -53,88 +68,6 @@ main :: () {
     e := My_Enum.A;
 }
 """
-
-
-# -- JSON-RPC client -----------------------------------------------------------
-
-class JsonRpcClient:
-    def __init__(self, process: subprocess.Popen[bytes]) -> None:
-        self.process = process
-
-    def send(self, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        assert self.process.stdin is not None
-        self.process.stdin.write(header + body)
-        self.process.stdin.flush()
-
-    def recv(self, timeout: float = 5.0) -> dict[str, Any]:
-        assert self.process.stdout is not None
-        header = b""
-        while not header.endswith(b"\r\n\r\n"):
-            ch = self.process.stdout.read(1)
-            if not ch:
-                # Try to read stderr for crash info
-                if self.process.stderr:
-                    remaining = self.process.stderr.read()
-                    if remaining:
-                        print(f"\n--- Server stderr at EOF ---\n{remaining.decode(errors='replace')}", file=sys.stderr)
-                raise EOFError("Server closed stdout")
-            header += ch
-        header_str = header.decode("ascii")
-        for line in header_str.split("\r\n"):
-            if line.startswith("Content-Length:"):
-                length = int(line.split(":")[1].strip())
-                break
-        else:
-            raise ValueError(f"No Content-Length in header: {header_str!r}")
-
-        body = self.process.stdout.read(length)
-        return json.loads(body.decode("utf-8"))
-
-    _next_id: int = 1
-
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        rid = self._next_id
-        self._next_id += 1
-        msg: dict[str, Any] = {
-            "jsonrpc": "2.0",
-            "id": rid,
-            "method": method,
-        }
-        if params is not None:
-            msg["params"] = params
-        self.send(msg)
-        # Read responses until we get one matching our request id
-        # (server may send log notifications interleaved)
-        for _ in range(50):
-            resp = self.recv()
-            if resp.get("id") == rid:
-                return resp
-            # Otherwise it's a notification (log message etc.) — ignore
-        raise TimeoutError(f"No response for request id {rid}")
-
-    def notify(self, method: str, params: dict[str, Any]) -> None:
-        msg: dict[str, Any] = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }
-        self.send(msg)
-
-
-# -- Helpers -------------------------------------------------------------------
-
-def find_jails_binary() -> str:
-    """Find the jails binary relative to the project root."""
-    test_dir = Path(__file__).resolve().parent
-    project_root = test_dir.parent
-    binary = project_root / "bin" / "jails"
-    if not binary.exists():
-        binary = project_root / "bin" / "jails.exe"
-    if not binary.exists():
-        sys.exit(f"Jails binary not found at {binary}")
-    return str(binary)
 
 
 def run_test() -> bool:

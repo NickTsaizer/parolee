@@ -436,10 +436,11 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             }
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
-            reset_diagnostics();
 
             // Content hash cache: skip re-parse + linked-file rebuild + analysis
-            // if content unchanged since last parse.
+            // if content unchanged since last parse. No clear here: with identical
+            // content old diagnostics stay valid, and clearing without a
+            // follow-up run would wipe live errors.
             {
                 file := get_file(file_path);
                 if file && file.content_hash != 0 {
@@ -460,6 +461,8 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
                 }
             }
 
+            // Content changed: clear stale squiggles, re-parse, re-diagnose.
+            reset_diagnostics();
             server.diagnostics_pending = true;
 
             // Shallow re-parse: current file only, imports/loads deferred to workers.
@@ -1023,6 +1026,13 @@ main :: () {
         } else {
             log("Jai path: % (%)", server.args.jai_path, server.args.jai_exe_name);
         }
+    }
+
+    // Explicit -jai_path leaves jai_exe_name empty; without a default the
+    // diagnostics compiler command becomes ".../bin/" (a directory) and
+    // exec fails with permission denied.
+    if server.args.jai_exe_name.count == 0 {
+        server.args.jai_exe_name = DEFAULT_JAI_EXE_NAME;
     }
 
     log("Args are %", server.args);

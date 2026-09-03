@@ -309,6 +309,15 @@ run_diagnostics :: () {
     diagnostic.range.end.line = diagnostic.range.start.line;
     diagnostic.range.end.character = diagnostic.range.start.character+highlighted_chars;
 
+    // No parseable error location (compiler launch failure, crash output,
+    // unknown format): publish nothing instead of a junk empty-uri diagnostic.
+    if file.count == 0 {
+        log_error("Diagnostics: no error location parsed");
+        if output.count > 0 free(output);
+        if error.count > 0 free(error);
+        return;
+    }
+
     diagnostics: [1]LSP_Diagnostic;
     diagnostics[0] = diagnostic;
 

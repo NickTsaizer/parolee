@@ -98,12 +98,16 @@ build_semantic_tokens :: (id: JSON_Value, uri: string, range_start: Node.Locatio
     // Dedup adjacent duplicates
     dedup_token_entries(*entries);
 
-    // For range requests, also clip by character bounds
+    // For range requests, also clip by character bounds.
+    // Clipped into a separate array: clip_range resets dst.count while
+    // iterating src, so src and dst must not alias.
     if has_range {
-        clip_range(entries, *entries, range_start, range_end);
+        clipped: [..]Token_Entry;
+        clip_range(entries, *clipped, range_start, range_end);
+        delta_encode_and_respond(clipped, id);
+    } else {
+        delta_encode_and_respond(entries, id);
     }
-
-    delta_encode_and_respond(entries, id);
 }
 
 // ── Token collection ────────────────────────────────────────────────────
