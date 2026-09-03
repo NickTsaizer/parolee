@@ -436,6 +436,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             }
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
+            reset_diagnostics();
 
             // Content hash cache: skip re-parse + linked-file rebuild + analysis
             // if content unchanged since last parse.
@@ -466,13 +467,9 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             // transitively imported modules, blocking completions for seconds after save.
             parse_file(file_path, true, true);
 
-            // Rebuild linked files immediately so completions/goto work right after save.
-            {
-                file := get_file(file_path);
-                if file ensure_linked_files(file);
-            }
-
-            // Trigger background import resolution + analysis (non-blocking).
+            // Trigger background import resolution + analysis. Avoid rebuilding
+            // linked_files synchronously here; huge projects can spend many
+            // seconds in get_file_links on didSave and starve LSP responses.
             finish_analysis_if_complete();
 
             server.diagnostics_pending = true;
@@ -514,17 +511,24 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             // (module.jai) was already parsed during init with follow_all=false,
             // missing some wrapped imports.
             {
+                target_file := get_file(file_path);
+                loader_candidates: [..]*Program_File;
+                loader_candidates.allocator = context.default_allocator;
                 loader_paths: [..]string;
                 loader_paths.allocator = context.default_allocator;
                 lock(*server.files_mutex);
                 for f: server.files {
                     if !f || f.path == file_path continue;
-                    loaded, _ := is_avaiable_from(f, file_path, true); // loads_only=true
+                    array_add(*loader_candidates, f);
+                }
+                unlock(*server.files_mutex);
+                for f: loader_candidates {
+                    loaded, _ := is_avaiable_from(f, target_file, true); // loads_only=true
                     if loaded {
                         array_add(*loader_paths, copy_string(f.path));
                     }
                 }
-                unlock(*server.files_mutex);
+                array_free(loader_candidates);
                 for path: loader_paths {
                     log("Re-parsing loader '%' due to didOpen of '%'", path, file_path);
                     parse_file(path, false, true, false);  // shallow, no follow_all; force=false
@@ -600,6 +604,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             }
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
+            reset_diagnostics();
             edit_memory_file(file_path, body.params.contentChanges);
             // Full parse (not shallow) — marks file for re-analysis; scheduler loop
             // handles incremental link resolution one file at a time.
@@ -846,6 +851,9 @@ worker_proc :: (thread: *Thread) -> s64 {
 start_worker_pool :: () {
     num := server.parse_workers;
     if num <= 0 num = max(1, get_number_of_processors() - 1);
+    // Parser/AST pools are not safe under concurrent parse_file calls yet.
+    // Keep background import parsing serialized to avoid corrupting semantic tokens.
+    if num > 1 num = 1;
     server.num_workers = num;
 
     // Create pipes for task signaling and completion signaling
@@ -1154,9 +1162,15 @@ main :: () {
         // Run pending diagnostics when needed.
         // Compiler runs as separate process — safe to run even when
         // workers are busy parsing imports.
-        if server.diagnostics_pending {
-            server.diagnostics_pending = false;
-            run_diagnostics();
+        if server.diagnostics_pending && !server.analysis_pending {
+            lock(*server.task_queue_mutex);
+            workers_idle := server.busy_workers == 0 && server.task_queue.count == 0;
+            unlock(*server.task_queue_mutex);
+
+            if workers_idle {
+                server.diagnostics_pending = false;
+                run_diagnostics();
+            }
         }
 
     }

@@ -26,3 +26,6 @@ last.md
 
 # Session files
 .tmp/
+
+# Python test cache
+__pycache__/

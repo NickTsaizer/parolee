@@ -44,3 +44,19 @@ log_path :: (path: []*Node) {
 operator == :: (a: Node.Location, b: Node.Location) -> bool {
     return a.l0 == b.l0 && a.l1 == b.l1 && a.c0 == b.c0 && a.c1 == b.c1;
 }
+
+// Shared request guard: non-blocking lock plus parse-in-progress check.
+// Returns true with file lock held — caller must unlock(*file.mutex).
+// Returns false after responding null (lock released or never taken).
+lock_file_for_request :: (file: *Program_File, id: JSON_Value) -> bool {
+    if !try_lock(*file.mutex) {
+        lsp_respond(id, null);
+        return false;
+    }
+    if file.parsing {
+        unlock(*file.mutex);
+        lsp_respond(id, null);
+        return false;
+    }
+    return true;
+}

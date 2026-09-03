@@ -78,6 +78,9 @@ build_semantic_tokens :: (id: JSON_Value, uri: string, range_start: Node.Locatio
         return;
     }
 
+    if !lock_file_for_request(file, id) return;
+    defer unlock(*file.mutex);
+
     has_range := range_start.l0 > 0 || range_end.l0 > 0;
 
     // Fix up missing parent pointers before token collection.
@@ -403,6 +406,9 @@ add_entry :: (line: int, col: int, len: int, tt: u32, mod: u32, entries: *[..]To
     if len <= 0 return;
     if col < 0 return;   // negative col = bogus position, skip
     if line < 0 return;  // negative line = bogus position, skip
+    if line > 4294967295 return;
+    if col > 4294967295 return;
+    if len > 4294967295 return;
     entry: Token_Entry = .{line=xx line, character=xx col, length=xx len, token_type=tt, token_modifiers=mod};
     array_add(entries, entry);
 }
@@ -480,7 +486,10 @@ classify_node :: (node: *Node) -> u32, u32, bool {
         case .CONTINUE;          #through;
         case .DEFER;             #through;
         case .REMOVE;            #through;
-        case .CAST;              #through;
+        case .CAST;
+            cast_node := cast(*Cast) node;
+            if cast_node.postfix return 0, 0, false;
+            #through;
         case .CASE;              #through;
         case .USING;             #through;
         case .STRUCT;            #through;
@@ -772,10 +781,11 @@ is_in_type_position :: (node: *Node, parent: *Node) -> bool {
     // NOT chain access: a.b.c — right side is another DOT (BINARY_OPERATION).
     if parent.kind == .BINARY_OPERATION {
         bin := cast(*Binary_Operation) parent;
-        if bin.operation == .DOT && bin.left == node && bin.right &&
-           bin.right.kind != .IDENTIFIER && bin.right.kind != .BINARY_OPERATION {
-
-            return true;
+        if bin.operation == .DOT && bin.left == node && bin.right && bin.right.kind == .LITERAL {
+            lit := cast(*Literal) bin.right;
+            if lit.value_type == .STRUCT || lit.value_type == .ARRAY {
+                return true;
+            }
         }
     }
     if parent.kind == .UNARY_OPERATION {

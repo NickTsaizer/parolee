@@ -15,7 +15,48 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     // see only [Preload, Runtime_Support] from the file's initial seed.
     ensure_linked_files(file);
 
+    if !lock_file_for_request(file, request.id) return;
+    defer unlock(*file.mutex);
+
     cursor_location := lsp_location_to_node_location(request.params.position, file_path);
+
+    receiver_dot_context := false;
+    assignment_dot_target: string;
+    if cursor_location.c0 > 0 {
+        lsp_pos: LSP_Position;
+        lsp_pos.line = cast(u32) cursor_location.l0;
+        lsp_pos.character = cast(u32) cursor_location.c0;
+        line_text := find_line_in_memory_file(file_path, lsp_pos);
+        if line_text.count > 0 && cursor_location.c0 - 1 < line_text.count && line_text[cursor_location.c0 - 1] == #char "." {
+            prev := cursor_location.c0 - 2;
+            if prev >= 0 {
+                ch := line_text[prev];
+                receiver_dot_context = (ch >= #char "a" && ch <= #char "z") ||
+                                       (ch >= #char "A" && ch <= #char "Z") ||
+                                       (ch >= #char "0" && ch <= #char "9") ||
+                                       ch == #char "_";
+            }
+
+            if !receiver_dot_context {
+                eq_pos := -1;
+                for i: 0 .. cursor_location.c0 - 2 {
+                    if line_text[i] == #char "=" eq_pos = i;
+                }
+                if eq_pos > 0 {
+                    start := 0;
+                    stop := eq_pos;
+                    colon_pos := -1;
+                    for i: 0 .. eq_pos - 1 {
+                        if line_text[i] == #char ":" colon_pos = i;
+                    }
+                    if colon_pos > 0 stop = colon_pos;
+                    while start < stop && line_text[start] <= #char " " start += 1;
+                    while stop > start && line_text[stop - 1] <= #char " " stop -= 1;
+                    if stop > start assignment_dot_target = copy_string(to_string(*line_text[start], stop - start));
+                }
+            }
+        }
+    }
 
     // We don't wanna to give completions inside comments.
     if inside_comment(cursor_location) {
@@ -30,30 +71,12 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     // binary_op ends at the dot but cursor is at the newline).
     dot_ok := false;
     dot_fields: [..]*Declaration;
+    if assignment_dot_target.count > 0 {
+        dot_ok, dot_fields = dot_completion_file_scan_fallback(file, cursor_location, assignment_dot_target, true);
+    }
     if !cursor_node && cursor_location.c0 > 0 {
-        lsp_pos: LSP_Position;
-        lsp_pos.line = cast(u32) cursor_location.l0;
-        lsp_pos.character = cast(u32) cursor_location.c0;
-        line_text := find_line_in_memory_file(file_path, lsp_pos);
-        if line_text.count > 0 && cursor_location.c0 - 1 < line_text.count {
-            ch := line_text[cursor_location.c0 - 1];
-            if ch == #char "." {
-                    extract_dot_var_name: string;
-                var_start := cursor_location.c0 - 2;
-                while var_start >= 0 && line_text[var_start] != #char " " && line_text[var_start] != #char "\t" {
-                    var_start -= 1;
-                }
-                if var_start < cursor_location.c0 - 2 {
-                    start_i := var_start + 1;
-                    var_len := cursor_location.c0 - 2 - start_i + 1;
-                    if var_len > 0 {
-                        extract_dot_var_name = copy_string(to_string(*line_text[start_i], var_len));
-                    }
-                }
-                while extract_dot_var_name.count > 0 && extract_dot_var_name[extract_dot_var_name.count - 1] == #char "." {
-                    extract_dot_var_name.count -= 1;
-                }
-                if extract_dot_var_name.count > 0 {
+        extract := extract_dot_var_name(file_path, cursor_location);
+        if extract.count > 0 {
                     // get_node_by_location with .BLOCK filter often fails because
                     // the parser sometimes doesn't set accurate end locations on BLOCKs.
                     // Manually scan file.nodes for the deepest (last) BLOCK starting
@@ -75,7 +98,7 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
                             }
 
                             type_node: *Node;
-                            if member.kind == .DECLARATION && member.(*Declaration).name == extract_dot_var_name {
+                            if member.kind == .DECLARATION && member.(*Declaration).name == extract {
                                 decl := cast(*Declaration) member;
                                 type_source: *Node = decl.type_inst;
                                 if !type_source { type_source = decl.expression; }
@@ -95,7 +118,7 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
                                     }
                                 }
                             } else if member.kind == .COMPOUND_DECLARATION {
-                                target_idx := resolve_compound_var_index(member, extract_dot_var_name);
+                                target_idx := resolve_compound_var_index(member, extract);
                                 if target_idx >= 0 {
                                     cd := cast(*Compound_Declaration) member;
                                     type_node = resolve_compound_var_type(cd, target_idx);
@@ -103,7 +126,7 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
                             }
 
                             if type_node {
-                                fields := get_type_fields(type_node);
+                                fields := get_dot_type_fields(type_node);
                                 if fields.count > 0 {
                                     dot_ok = true;
                                     dot_fields = fields;
@@ -115,11 +138,9 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
 
                     // Block scan missed it — scan all file nodes for the declaration.
                     if !dot_ok {
-                        dot_ok, dot_fields = dot_completion_file_scan_fallback(file, cursor_location, extract_dot_var_name);
+                        dot_ok, dot_fields = dot_completion_file_scan_fallback(file, cursor_location, extract);
                     }
                 }
-            }
-        }
     }
 
     if cursor_node {
@@ -185,6 +206,11 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
         return;
     }
 
+    if receiver_dot_context {
+        lsp_respond(request.id, null);
+        return;
+    }
+
     // General
     decls := get_declarations(file, cursor_node, *cursor_location);
 
@@ -197,40 +223,34 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
             decls.count, valid_count, file.linked_files.count, file.path);
     }
 
-    // Extract prefix: what user has typed so far.
+    // Extract prefix: what user has typed left of the cursor.
+    // If completion is requested inside a token (e.g. h|world), the parser's
+    // identifier node spans the whole token (hworld). Completion matching must
+    // use only the typed prefix before the cursor so `hello` still matches `h`.
     prefix: string;
-    if cursor_node && cursor_node.kind == .IDENTIFIER {
-        ident := cast(*Identifier) cursor_node;
-        prefix = ident.name;
-    } else {
-        // cursor_node is null or not an identifier — scan source text.
-        // Cursor sits just past the typed token (LSP convention), so
-        // get_node_by_location's contains() misses it. Extract prefix
-        // by walking backwards from cursor to find the identifier start.
-        if cursor_location.c0 > 0 {
-            lsp_pos: LSP_Position;
-            lsp_pos.line = cast(u32) cursor_location.l0;
-            lsp_pos.character = cast(u32) cursor_location.c0;
-            line_text := find_line_in_memory_file(file_path, lsp_pos);
-            if line_text.count > 0 {
-                end := cursor_location.c0;
-                if end > line_text.count then end = line_text.count;
-                start := end - 1;
-                while start >= 0 {
-                    ch := line_text[start];
-                    if !(ch >= #char "a" && ch <= #char "z") &&
-                       !(ch >= #char "A" && ch <= #char "Z") &&
-                       !(ch >= #char "0" && ch <= #char "9") &&
-                       ch != #char "_" {
-                        start += 1;
-                        break;
-                    }
-                    start -= 1;
+    if cursor_location.c0 > 0 {
+        lsp_pos: LSP_Position;
+        lsp_pos.line = cast(u32) cursor_location.l0;
+        lsp_pos.character = cast(u32) cursor_location.c0;
+        line_text := find_line_in_memory_file(file_path, lsp_pos);
+        if line_text.count > 0 {
+            end := cursor_location.c0;
+            if end > line_text.count then end = line_text.count;
+            start := end - 1;
+            while start >= 0 {
+                ch := line_text[start];
+                if !(ch >= #char "a" && ch <= #char "z") &&
+                   !(ch >= #char "A" && ch <= #char "Z") &&
+                   !(ch >= #char "0" && ch <= #char "9") &&
+                   ch != #char "_" {
+                    start += 1;
+                    break;
                 }
-                if start < 0 then start = 0;
-                if end > start {
-                    prefix = copy_string(to_string(*line_text[start], end - start));
-                }
+                start -= 1;
+            }
+            if start < 0 then start = 0;
+            if end > start {
+                prefix = copy_string(to_string(*line_text[start], end - start));
             }
         }
     }
@@ -377,7 +397,7 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
 
     type := get_path_type(path);
     if type {
-        fields := get_type_fields(type);
+        fields := get_dot_type_fields(type);
         if fields.count > 0 {
             return true, fields;
         }
@@ -445,7 +465,7 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
                 }
 
                 if type_node {
-                    fields := get_type_fields(type_node);
+                    fields := get_dot_type_fields(type_node);
                     if fields.count > 0 {
                         return true, fields;
                     }
@@ -616,7 +636,9 @@ handle_assignment_completitions :: (request: LSP_Request_Message_Completion, cur
 // Recursively scan a BLOCK and its sub-blocks for a local variable declaration
 // before cursor_position. Returns the declaration (or null).
 scan_var_in_block :: (block: *Block, var_name: string, cursor_location: Node.Location) -> *Declaration {
+    if !block return null;
     for member: block.members {
+        if !member continue;
         if cursor_location.l0 < member.location.l0 continue;
 
         if member.kind == .DECLARATION {
@@ -625,8 +647,10 @@ scan_var_in_block :: (block: *Block, var_name: string, cursor_location: Node.Loc
         } else if member.kind == .COMPOUND_DECLARATION {
             cd := cast(*Compound_Declaration) member;
             for item: cd.members {
+                if !item continue;
                 if item.kind != .COMPOUND_DECLARATION_ITEM continue;
                 cdi := cast(*Compound_Declaration_Item) item;
+                if !cdi.expression continue;
                 if cdi.expression.kind != .IDENTIFIER continue;
                 if (cast(*Identifier) cdi.expression).name == var_name return cast(*Declaration) cd;
             }
@@ -638,23 +662,23 @@ scan_var_in_block :: (block: *Block, var_name: string, cursor_location: Node.Loc
             if r return r;
         } else if member.kind == .IF {
             if_node := cast(*If) member;
-            if if_node._then {
+            if if_node._then && if_node._then.kind == .BLOCK {
                 r := scan_var_in_block(cast(*Block) if_node._then, var_name, cursor_location);
                 if r return r;
             }
-            if if_node._else {
+            if if_node._else && if_node._else.kind == .BLOCK {
                 r := scan_var_in_block(cast(*Block) if_node._else, var_name, cursor_location);
                 if r return r;
             }
         } else if member.kind == .FOR {
             for_node := cast(*For) member;
-            if for_node.body {
+            if for_node.body && for_node.body.kind == .BLOCK {
                 r := scan_var_in_block(cast(*Block) for_node.body, var_name, cursor_location);
                 if r return r;
             }
         } else if member.kind == .WHILE {
             while_node := cast(*While) member;
-            if while_node.body {
+            if while_node.body && while_node.body.kind == .BLOCK {
                 r := scan_var_in_block(cast(*Block) while_node.body, var_name, cursor_location);
                 if r return r;
             }
@@ -665,45 +689,58 @@ scan_var_in_block :: (block: *Block, var_name: string, cursor_location: Node.Loc
 
 // ── Compound declaration helpers ──────────────────────────────────────────
 
+// Extract receiver path before nearest dot on cursor line.
+// Tries cursor-on-dot, cursor-after-dot, dot-at-line-end, then scans back
+// over identifier chars plus dots (multi-segment paths like a.b).
+// Returns heap copy or empty string when no dot found.
+extract_dot_var_name :: (file_path: string, cursor_location: Node.Location) -> string {
+    lsp_pos: LSP_Position;
+    lsp_pos.line = cast(u32) cursor_location.l0;
+    lsp_pos.character = cast(u32) cursor_location.c0;
+    line_text := find_line_in_memory_file(file_path, lsp_pos);
+    if line_text.count == 0 return "";
+
+    dot_col: s32 = -1;
+    // Try: cursor is on the dot (var. → char = '.')
+    if cursor_location.c0 < line_text.count && line_text[cursor_location.c0] == #char "." {
+        dot_col = cast(s32) cursor_location.c0;
+    }
+    // Try: cursor is after the dot (var.fi → char before cursor = '.')
+    if dot_col < 0 && cursor_location.c0 > 0 && cursor_location.c0 - 1 < line_text.count && line_text[cursor_location.c0 - 1] == #char "." {
+        dot_col = cast(s32) cursor_location.c0 - 1;
+    }
+    // Try: cursor past end of line — check last char if it's '.'
+    if dot_col < 0 && line_text[line_text.count - 1] == #char "." {
+        dot_col = cast(s32) line_text.count - 1;
+    }
+    if dot_col < 0 return "";
+
+    var_start := dot_col - 1;
+    while var_start >= 0 && ((line_text[var_start] >= #char "a" && line_text[var_start] <= #char "z") || (line_text[var_start] >= #char "A" && line_text[var_start] <= #char "Z") || (line_text[var_start] >= #char "0" && line_text[var_start] <= #char "9") || line_text[var_start] == #char "_" || line_text[var_start] == #char ".") {
+        var_start -= 1;
+    }
+    start_i := var_start + 1;
+    var_len := dot_col - start_i;
+    if var_len <= 0 return "";
+
+    var_name := copy_string(to_string(*line_text[start_i], var_len));
+
+    // Double/trailing dots like `rs..` can leave `var_name` ending in `.`.
+    while var_name.count > 0 && var_name[var_name.count - 1] == #char "." {
+        var_name.count -= 1;
+    }
+    return var_name;
+}
+
 // Scan file.nodes for a declaration matching the variable before a dot.
 // Used as fallback when block scan and node-tree dot resolution both fail.
-dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node.Location, var_name_hint: string = "") -> (bool, [..]*Declaration) {
+dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node.Location, var_name_hint: string = "", allow_enum_fields := false) -> (bool, [..]*Declaration) {
     empty: [..]*Declaration;
 
     // Extract variable name from source text if not provided
     var_name := var_name_hint;
     if var_name.count == 0 {
-        lsp_pos: LSP_Position;
-        lsp_pos.line = cast(u32) cursor_location.l0;
-        lsp_pos.character = cast(u32) cursor_location.c0;
-        line_text := find_line_in_memory_file(file.path, lsp_pos);
-        if line_text.count > 0 {
-            // Determine where the variable name ends (before the dot)
-            dot_col: s32 = -1;
-            // Try: cursor is on the dot (var. → char = '.')
-            if cursor_location.c0 < line_text.count && line_text[cursor_location.c0] == #char "." {
-                dot_col = cast(s32) cursor_location.c0;
-            }
-            // Try: cursor is after the dot (var.fi → char before cursor = '.')
-            if dot_col < 0 && cursor_location.c0 > 0 && cursor_location.c0 - 1 < line_text.count && line_text[cursor_location.c0 - 1] == #char "." {
-                dot_col = cast(s32) cursor_location.c0 - 1;
-            }
-            // Try: cursor past end of line — check last char if it's '.'
-            if dot_col < 0 && line_text.count > 0 && line_text[line_text.count - 1] == #char "." {
-                dot_col = cast(s32) line_text.count - 1;
-            }
-            if dot_col >= 0 {
-                var_start := dot_col - 1;
-                while var_start >= 0 && ((line_text[var_start] >= #char "a" && line_text[var_start] <= #char "z") || (line_text[var_start] >= #char "A" && line_text[var_start] <= #char "Z") || (line_text[var_start] >= #char "0" && line_text[var_start] <= #char "9") || line_text[var_start] == #char "_" || line_text[var_start] == #char ".") {
-                    var_start -= 1;
-                }
-                start_i := var_start + 1;
-                var_len := dot_col - start_i;
-                if var_len > 0 {
-                    var_name = copy_string(to_string(*line_text[start_i], var_len));
-                }
-            }
-        }
+        var_name = extract_dot_var_name(file.path, cursor_location);
     }
     if var_name.count == 0 return false, empty;
 
@@ -743,7 +780,7 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                     }
                 }
                 if node_to_resolve {
-                    fields := get_type_fields(node_to_resolve);
+                    fields := get_dot_type_fields(node_to_resolve, allow_enum_fields);
                     append_inserted_fields_for_decl_exact(*fields, decl);
                     if fields.count > 0 {
                         return true, fields;
@@ -756,7 +793,7 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                 cd := cast(*Compound_Declaration) node;
                 type_node := resolve_compound_var_type(cd, target_idx);
                 if type_node {
-                    fields := get_type_fields(type_node);
+                    fields := get_dot_type_fields(type_node, allow_enum_fields);
                     if fields.count > 0 {
                         return true, fields;
                     }
@@ -771,7 +808,7 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
         root_decl := cast(*Declaration) node;
         if !root_decl.expression || root_decl.expression.kind != .PROCEDURE continue;
         proc := cast(*Procedure) root_decl.expression;
-        if !proc.body continue;
+        if !proc.body || proc.body.kind != .BLOCK continue;
 
         local_decl := scan_var_in_block(proc.body, var_name, cursor_location);
         if local_decl {
@@ -805,7 +842,7 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                     }
                 }
                 if node_to_resolve {
-                    fields := get_type_fields(node_to_resolve);
+                    fields := get_dot_type_fields(node_to_resolve, allow_enum_fields);
                     if local_decl.kind == .DECLARATION {
                         append_inserted_fields_for_decl_exact(*fields, cast(*Declaration) local_decl);
                     }
@@ -876,7 +913,7 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                     root_decl := cast(*Declaration) node;
                     if !root_decl.expression || root_decl.expression.kind != .PROCEDURE continue;
                     proc := cast(*Procedure) root_decl.expression;
-                    if !proc.body continue;
+                    if !proc.body || proc.body.kind != .BLOCK continue;
 
                     local := scan_var_in_block(proc.body, first_var, cursor_location);
                     if local && local.kind == .DECLARATION {
@@ -964,7 +1001,7 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
                 }
 
                 if ok {
-                    fields := get_type_fields(current_type);
+                    fields := get_dot_type_fields(current_type, allow_enum_fields);
                     if fields.count > 0 return true, fields;
                 }
             }
@@ -985,7 +1022,7 @@ dot_completion_file_scan_fallback :: (file: *Program_File, cursor_location: Node
             if !type_source continue;
             resolved := get_node_type(type_source);
             if !resolved continue;
-            fields := get_type_fields(resolved);
+            fields := get_dot_type_fields(resolved, allow_enum_fields);
             if fields.count > 0 {
                 append_inserted_fields_for_decl_exact(*fields, it);
                 return true, fields;
@@ -1219,6 +1256,38 @@ append_inserted_fields_for_decl :: (decls: *[..]*Declaration, decl: *Declaration
     }
 }
 
+add_struct_union_fields :: (decls: *[..]*Declaration, node: *Node, args: []*Node) {
+    add_all_fields_of(decls, node);
+
+    // Add polymorphic parameter names as synthetic fields
+    for arg: args {
+        if !arg continue;
+        param_name := get_polymorphic_param_name(arg);
+        if param_name.count == 0 continue;
+        synth_decl := New(Declaration);
+        synth_decl.name = param_name;
+        synth_decl.const = false;
+        synth_decl.has_elsewhere = false;
+        append_unique_completion_decl(decls, synth_decl);
+    }
+
+    // Add compiler-harvested #insert fields
+    // NOTE: STRUCT/UNION case is hit from get_node_type which loses type
+    // args, so no filtering here. Callers that have type args should
+    // pass PROCEDURE_CALL directly to get_type_fields instead.
+    if node.parent && node.parent.kind == .DECLARATION {
+        parent_decl := cast(*Declaration) node.parent;
+        append_inserted_fields_for_decl_exact(decls, parent_decl);
+    }
+}
+
+get_dot_type_fields :: (node: *Node, allow_enum_fields := false) -> [..]*Declaration {
+    empty: [..]*Declaration;
+    if !node return empty;
+    if node.kind == .ENUM && !allow_enum_fields return empty;
+    return get_type_fields(node);
+}
+
 // Collect type fields for a node without sending any response.
 // Returns decls in declaration form (caller converts to LSP items).
 get_type_fields :: (node: *Node) -> [..]*Declaration {
@@ -1247,32 +1316,14 @@ get_type_fields :: (node: *Node) -> [..]*Declaration {
     }
 
     if node.kind == {
-        case .UNION; #through;
-        case .ENUM; #through;
         case .STRUCT;
             _struct := cast(*Struct) node;
+            add_struct_union_fields(*decls, node, _struct.polymorphic_arguments);
+        case .UNION;
+            _union := cast(*Union) node;
+            add_struct_union_fields(*decls, node, _union.polymorphic_arguments);
+        case .ENUM;
             add_all_fields_of(*decls, node);
-
-            // Add polymorphic parameter names as synthetic fields
-            for arg: _struct.polymorphic_arguments {
-                if !arg continue;
-                param_name := get_polymorphic_param_name(arg);
-                if param_name.count == 0 continue;
-                synth_decl := New(Declaration);
-                synth_decl.name = param_name;
-                synth_decl.const = false;
-                synth_decl.has_elsewhere = false;
-                append_unique_completion_decl(*decls, synth_decl);
-            }
-
-            // Add compiler-harvested #insert fields
-            // NOTE: STRUCT case is hit from get_node_type which loses type
-            // args, so no filtering here. Callers that have type args should
-            // pass PROCEDURE_CALL directly to get_type_fields instead.
-            if node.parent && node.parent.kind == .DECLARATION {
-                parent_decl := cast(*Declaration) node.parent;
-                append_inserted_fields_for_decl_exact(*decls, parent_decl);
-            }
         case .TYPE_INSTANTIATION;
             ti := cast(*Type_Instantiation) node;
             // If the target expression is an IDENTIFIER, resolve it to its

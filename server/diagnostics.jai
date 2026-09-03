@@ -9,6 +9,8 @@ reset_diagnostics :: () {
                 diagnostics = LSP_Diagnostic.[]
             }
         });
+        free(server.previously_errored_file);
+        server.previously_errored_file = "";
     }
 }
 
