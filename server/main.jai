@@ -406,6 +406,10 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             init(*server.deferred_mutex);
 
             // Parse Runtime Support and Preload (needed for built-in type resolution)
+            // Progress reported live: flush each phase so clients see indexing
+            // instead of silence (output queue otherwise flushes after init).
+            progress_begin("jails-init", "Indexing", "Resolving prelude");
+            flush_output_queue();
             server.skip_reanalyze = true;
             defer server.skip_reanalyze = false;
             {
@@ -425,13 +429,19 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             }
 
             log("INIT: analyze_files...");
+            progress_report("jails-init", "Linking files");
+            flush_output_queue();
             analyze_files();
 
             log("INIT: respond...");
             to_send: LSP_Result_Initialize;
             lsp_respond(body.id, to_send);
 
+            progress_report("jails-init", "Running diagnostics");
+            flush_output_queue();
             run_diagnostics();
+            progress_end("jails-init", "Indexing complete");
+            flush_output_queue();
 
         case "textDocument/definition";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Definition,, temp);
@@ -748,11 +758,18 @@ progress_begin :: (token: string, title: string, message := "") {
     server.progress_next_id -= 1;
     send_progress_create(token, id);
     send_progress_begin(token, title, message);
+    // Heap-copy: callers may pass temp strings (drain handlers run on temp).
+    saved := context.allocator;
+    context.allocator = context.default_allocator;
+    entry_token := copy_string(token);
+    entry_title := copy_string(title);
+    entry_message := copy_string(message);
+    context.allocator = saved;
     array_add(*server.progress_tokens, Progress_Token.{
         id = id,
-        token = copy_string(token),
-        title = copy_string(title),
-        message = copy_string(message),
+        token = entry_token,
+        title = entry_title,
+        message = entry_message,
         begun = true,
     });
 }
