@@ -28,8 +28,12 @@ some_code(); // hello
 // moon
 hello_moon :: () {}
 
-main :: () {
+hello :: 1;
+world :: 2;
+
+main :: () -> s64 {
     hello_
+    return hworld;
 }
 """
 
@@ -267,7 +271,45 @@ def main() -> int:
                 )
             print("PASS: hello_moon docs exclude inline comment from previous line")
 
+            completion_line = TEST_SOURCE.splitlines().index("    return hworld;")
+            completion_character = len("    return h")
+
             req_id = 3
+            client.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "textDocument/completion",
+                    "params": {
+                        "textDocument": {"uri": file_uri(source_path)},
+                        "position": {
+                            "line": completion_line,
+                            "character": completion_character,
+                        },
+                    },
+                }
+            )
+
+            completion_response = client.wait_for_response(req_id)
+            if "error" in completion_response:
+                raise RuntimeError(f"Completion failed: {completion_response['error']}")
+
+            items = completion_response.get("result")
+            if not isinstance(items, list):
+                raise AssertionError(f"Expected completion list, got: {items!r}")
+
+            hello_item = next(
+                (item for item in items if item.get("label") == "hello"), None
+            )
+            if hello_item is None:
+                labels = [item.get("label") for item in items]
+                raise AssertionError(
+                    "Completion inside h|world does not include label='hello'. "
+                    f"Got labels: {labels!r}"
+                )
+            print("PASS: completion inside h|world uses prefix left of cursor")
+
+            req_id = 4
             client.send(
                 {"jsonrpc": "2.0", "id": req_id, "method": "shutdown", "params": {}}
             )

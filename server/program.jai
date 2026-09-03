@@ -25,6 +25,7 @@ Program_File :: struct {
     analysis_pool: Pool;
 
     content_hash: u64;   // djb2 hash of last-parsed content; skip re-parse if unchanged
+    parsing: bool;       // true while AST is being rebuilt
 
     mutex: Mutex;  // guards declarations + nodes during concurrent worker access
 }
@@ -232,24 +233,12 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
     // Reset back to default allocator, we dont want to use pool from "parent" file...
     push_allocator(context.default_allocator);
 
-    // Thread-safe shallow flag: each caller passes its own value.
-    // No global state mutation — node_visit reads server.shallow_parse
-    // which is set per parse_file call.
-    saved_shallow := server.shallow_parse;
-    server.shallow_parse = shallow;
-    defer server.shallow_parse = saved_shallow;
-
-    // follow_all: root file gets all imports resolved; imported files
-    // only follow 'using X :: #import "X"' declarations to prevent recursive
-    // transitive loading (e.g. Basic → #import "POSIX" → 100+ modules).
-    saved_follow_all := server.follow_all_imports;
-    server.follow_all_imports = follow_all;
-    defer server.follow_all_imports = saved_follow_all;
-
     saved_allocator_for_path := context.allocator;
     context.allocator = temp;
-    path := normalize_path(input_path);
+    temp_path := normalize_path(input_path);
     context.allocator = saved_allocator_for_path;
+    path := copy_string(temp_path);
+    defer if path.count > 0 free(path);
 
     // Load content before acquiring files_mutex so we can hash-check
     // and skip re-parse without destroying existing AST data in reset_file.
@@ -290,9 +279,7 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
             if hash == file.content_hash {
                 // Still queue for re-analysis — linked_files may need
                 // rebuilding (e.g. didOpen clears it, or imports changed).
-                lock(*server.files_mutex);
                 array_add_if_unique(*server.files_to_be_analyzed, file);
-                unlock(*server.files_mutex);
                 unlock(*server.files_mutex);  // from outer lock
                 if content_from_file free(content);
                 log("CACHE HIT: skipping re-parse of % (content unchanged)", path);
@@ -311,6 +298,10 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
         unlock(*server.files_mutex);
     }
 
+    lock(*file.mutex);
+    file.parsing = true;
+    unlock(*file.mutex);
+
     // log("Parse file: %", path);
 
     path_without_filename := trim_right(path_strip_filename(file.path), "/");
@@ -324,6 +315,8 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
         parser.user_data.allocator = _pool;
         parser.user_data.file = file;
         parser.user_data.path_without_filename = normalize_path(path_without_filename);
+        parser.user_data.shallow = shallow;
+        parser.user_data.follow_all = follow_all;
         parser.node_visit = node_visit;
         parser.lexer = *create_lexer(content, file.path);
 
@@ -334,6 +327,10 @@ parse_file :: (input_path: string, force := false, shallow := false, follow_all 
         file.global_block.members = parser.user_data.global_members;
         file.comments = parser.lexer.comments;
     }
+
+    lock(*file.mutex);
+    file.parsing = false;
+    unlock(*file.mutex);
 
     file.content_hash = content_hash(cast([]u8) content);
     if content_from_file free(content);
@@ -604,6 +601,8 @@ Node_Visit_Data :: struct {
     global_members: [..]*Node;
     allocator: Allocator;
     path_without_filename: string;
+    shallow: bool;
+    follow_all: bool;
 }
 
 node_visit :: (node: *Node, data: Node_Visit_Data) {
@@ -677,9 +676,9 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
         // follow_all=true (root file): follow EVERY #import (bare + using).
         // follow_all=false (imported file): only follow wrapped_in_decl —
         // prevents recursive transitive loading (e.g. Basic → #import "POSIX").
-        root_or_wrapped := server.follow_all_imports || wrapped_in_decl || wrapped_in_bare_using;
+        root_or_wrapped := data.follow_all || wrapped_in_decl || wrapped_in_bare_using;
         if root_or_wrapped {
-            if server.shallow_parse {
+            if data.shallow {
                 // Defer import parsing: collect path for background resolution
                 // Copy using default allocator — current context is pool, freed on re-parse
                 if path.count > 0 {
@@ -720,7 +719,7 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
 
         load_relative_path := normalize_path(join(data.path_without_filename, _load.file, separator="/"));
         array_add(*data.file.loads, Resolved_Load.{ resolved_path=load_relative_path });
-        if server.shallow_parse {
+        if data.shallow {
             lock(*server.deferred_mutex);
             saved := context.allocator;
             context.allocator = context.default_allocator;
@@ -885,7 +884,7 @@ get_file_links :: (file: *Program_File) -> [..]Linked_File {
                     break;
                 }
 
-                avaiable, from_import= := is_avaiable_from(file_that_load_this_file, it.path);
+                avaiable, from_import= := is_avaiable_from(file_that_load_this_file, it);
                 if !avaiable continue;
 
                 is_avaiable_from_one_of_the_parents = true;
@@ -893,7 +892,7 @@ get_file_links :: (file: *Program_File) -> [..]Linked_File {
             }
 
             if !is_avaiable_from_one_of_the_parents {
-                avaiable, from_import= := is_avaiable_from(file, it.path);
+                avaiable, from_import= := is_avaiable_from(file, it);
                 if !avaiable continue;
             }
         }
@@ -1344,7 +1343,7 @@ get_files_that_use :: (target_file: *Program_File) -> []*Program_File {
     files: [..]*Program_File;
 
     for file: server.files {
-        if !is_avaiable_from(file, target_file.path) continue;
+        if !is_avaiable_from(file, target_file) continue;
         array_add(*files, file);
     }
 
@@ -1353,42 +1352,42 @@ get_files_that_use :: (target_file: *Program_File) -> []*Program_File {
 
 get_files_that_load :: (target_file: *Program_File) -> []*Program_File {
     files: [..]*Program_File;
-    target := target_file.path;
-
     count := 0;
     for file: server.files {
         if !file continue;
         count += 1;
-        if !is_avaiable_from(file, target, true) continue;
+        if !is_avaiable_from(file, target_file, true) continue;
         array_add(*files, file);
     }
-    log("FILES_THAT_LOAD: target=% files_in_server=% found=%", target, count, files.count);
+    log("FILES_THAT_LOAD: target=% files_in_server=% found=%", target_file.path, count, files.count);
 
     for f: files log("  PARENT: %", f.path);
 
     return files;
 }
 
-is_avaiable_from :: (file: *Program_File, path: string, $loads_only := false, $max_import_depth : s32 = 3) -> bool, bool {
-    already_checked: [..]string;
-    loaded, from_import := is_avaiable_from_impl(file, path, *already_checked, loads_only, max_import_depth);
+is_avaiable_from :: (file: *Program_File, target: *Program_File, $loads_only := false, $max_import_depth : s32 = 3) -> bool, bool {
+    already_checked: [..]*Program_File;
+    loaded, from_import := is_avaiable_from_impl(file, target, *already_checked, loads_only, max_import_depth);
     array_free(already_checked);
     return loaded, from_import;
 }
 
-is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[..]string, $loads_only := false, max_import_depth: s32 = 0, in_using_context := false) -> bool, bool {
+is_avaiable_from_impl :: (file: *Program_File, target: *Program_File, already_checked: *[..]*Program_File, $loads_only := false, max_import_depth: s32 = 0, in_using_context := false) -> bool, bool {
     from_import: bool;
     loaded: bool;
 
+    if !file || !target return false, false;
+
     #if !loads_only {
         for file.imports {
-            target_path := it.root;
-            if target_path.count == 0 && it.target target_path = it.target.path;
-            if target_path.count == 0 continue;
-            if array_find(already_checked.*, target_path) continue;
-            array_add(already_checked, target_path);
+            next_file := it.target;
+            if !next_file && it.root.count > 0 next_file = get_file(it.root);
+            if !next_file continue;
+            if array_find(already_checked.*, next_file) continue;
+            array_add(already_checked, next_file);
 
-            if target_path == path {
+            if next_file == target {
                 // Accept direct imports (in_using_context=false) or using
                 // imports (it.is_using=true). Skip non-using transitive
                 // imports entirely — they don't push visibility up and
@@ -1409,13 +1408,9 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
             if max_import_depth <= 1 continue;
             if in_using_context && !it.is_using continue;
 
-            next_file := it.target;
-            if !next_file next_file = get_file(target_path);
-            if !next_file continue;
-
             // Any recursion enters a "transitive" context where only
             // `using` imports are visible — regular imports don't push up.
-            found, child_from_import := is_avaiable_from_impl(next_file, path, already_checked, false, max_import_depth - 1, true); // in_using_context
+            found, child_from_import := is_avaiable_from_impl(next_file, target, already_checked, false, max_import_depth - 1, true); // in_using_context
 
             if found {
                 from_import = child_from_import;
@@ -1426,23 +1421,20 @@ is_avaiable_from_impl :: (file: *Program_File, path: string, already_checked: *[
     }
 
     for file.loads {
-        load_relative_path := it.resolved_path;
-        if load_relative_path.count == 0 && it.target load_relative_path = it.target.path;
-        if load_relative_path.count == 0 continue;
+        next_file := it.target;
+        if !next_file && it.resolved_path.count > 0 next_file = get_file(it.resolved_path);
+        if !next_file continue;
 
-        if load_relative_path == path {
+        if next_file == target {
             loaded = true;
             break;
         }
 
-        if array_find(already_checked.*, load_relative_path) continue;
-        array_add(already_checked, load_relative_path);
-
-        next_file := it.target;
-        if !next_file next_file = get_file(load_relative_path);
+        if array_find(already_checked.*, next_file) continue;
+        array_add(already_checked, next_file);
         // Propagate in_using_context through loads — loaded files share
         // the same module scope, so the visibility context is preserved.
-        if next_file && is_avaiable_from_impl(next_file, path, already_checked, loads_only, max_import_depth, in_using_context) {
+        if is_avaiable_from_impl(next_file, target, already_checked, loads_only, max_import_depth, in_using_context) {
             loaded = true;
             break;
         }
