@@ -14,6 +14,18 @@ User_Options :: struct {
     use_symbols_from_local_modules: bool;
 }
 
+// Live window/workDoneProgress/create handshake. create is sent first and
+// begin follows immediately (ordered transport keeps create before begin);
+// the ack only matters for rejection, which drops the token silently.
+Progress_Token :: struct {
+    id: s64;          // outbound create request id (negative)
+    token: string;    // heap copies; freed when the entry is removed
+    title: string;
+    message: string;
+    begun: bool;      // begin sent
+    dead: bool;       // client rejected create
+}
+
 Server :: struct {
     args: Args;
     quit := false;
@@ -39,6 +51,8 @@ Server :: struct {
     files_changed_since_diagnostics: bool;  // skip diagnostics on save if no files changed
     token_busy: bool;            // rate-limit: skip if semantic tokens already processing
     progress_cycle: int;         // unique token per batch progress cycle
+    progress_next_id: s64 = -1;  // outbound request ids; client ids are non-negative
+    progress_tokens: [..]Progress_Token;  // live create handshakes (main thread only)
     skip_reanalyze: bool;        // init: skip get_files_that_use (O(n²) overhead, no existing files need reanalysis)
 
     files_mutex: Mutex;          // thread-safe access to server.files + server.files_to_be_analyzed
@@ -697,6 +711,113 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 // ── Import dispatch (async worker pool) ────────────────────────────────
 // Push deferred imports to worker queue up to batch size.
 // Workers run persistently — main thread never blocks on join.
+// ── Progress handshake (main thread only) ───────────────────────────────
+// Tokens live here from create to end. begin/report go out only for acked
+// tokens; rejections and unknown responses are dropped silently.
+
+find_progress_token :: (token: string) -> *Progress_Token {
+    for *pt: server.progress_tokens {
+        if pt.token == token return pt;
+    }
+    return null;
+}
+
+find_progress_by_id :: (id: s64) -> *Progress_Token {
+    for *pt: server.progress_tokens {
+        if pt.id == id return pt;
+    }
+    return null;
+}
+
+remove_progress_token :: (token: string) {
+    for entry, i: server.progress_tokens {
+        if entry.token != token continue;
+        if entry.token.count > 0 free(entry.token);
+        if entry.title.count > 0 free(entry.title);
+        if entry.message.count > 0 free(entry.message);
+        array_ordered_remove_by_index(*server.progress_tokens, i);
+        return;
+    }
+}
+
+// Request creation plus immediate begin (transport order keeps create
+// first). Rejection arrives later and drops the token silently.
+progress_begin :: (token: string, title: string, message := "") {
+    if find_progress_token(token) return;  // handshake already live
+    id := server.progress_next_id;
+    server.progress_next_id -= 1;
+    send_progress_create(token, id);
+    send_progress_begin(token, title, message);
+    array_add(*server.progress_tokens, Progress_Token.{
+        id = id,
+        token = copy_string(token),
+        title = copy_string(title),
+        message = copy_string(message),
+        begun = true,
+    });
+}
+
+// Drop rejected tokens; called each scheduler loop.
+// Unknown/stale tokens are ignored; rejected ones removed.
+pump_progress_tokens :: () {
+    if server.progress_tokens.count == 0 return;
+    i := server.progress_tokens.count - 1;
+    while i >= 0 {
+        if server.progress_tokens[i].dead {
+            pt := server.progress_tokens[i];
+            if pt.token.count > 0 free(pt.token);
+            if pt.title.count > 0 free(pt.title);
+            if pt.message.count > 0 free(pt.message);
+            array_ordered_remove_by_index(*server.progress_tokens, i);
+        }
+        i -= 1;
+    }
+}
+
+progress_report :: (token: string, message: string) {
+    pt := find_progress_token(token);
+    if !pt || !pt.begun || pt.dead return;
+    send_progress_report(token, message);
+}
+
+progress_end :: (token: string, message := "") {
+    pt := find_progress_token(token);
+    if !pt return;
+    if pt.begun && !pt.dead {
+        send_progress_end(token, message);
+    }
+    remove_progress_token(token);
+}
+
+report_progress_percentage :: () {
+    lock(*server.deferred_mutex);
+    processed := server.deferred_processed;
+    total := server.deferred_total;
+    unlock(*server.deferred_mutex);
+    if total <= 0 || processed <= 0 return;
+    progress_report(tprint("jails-parse-%", server.progress_cycle),
+        tprint("%/% files", processed, total));
+}
+
+// Client response to our own request (create ack/reject). True when the
+// id matches a live progress handshake.
+handle_client_response :: (body: string) -> bool {
+    ok, root := json_parse_string(body);
+    if !ok || root.type != .OBJECT || !root.object return false;
+    ok_id, id_val := table_find(root.object, "id");
+    if !ok_id || id_val.type != .NUMBER return false;
+    pt := find_progress_by_id(cast(s64) id_val.number);
+    if !pt return false;
+    ok_err, err_val := table_find(root.object, "error");
+    if ok_err && err_val.type != .NULL {
+        pt.dead = true;
+        log("Progress token % rejected by client", pt.token);
+    }
+    // Success ack needs no action: begin already went out right after
+    // create, and the ordered transport keeps create first.
+    return true;
+}
+
 // Progress cycles per dispatch batch.
 
 PARALLEL_BATCH :: 4;
@@ -716,18 +837,18 @@ dispatch_imports :: () {
     available := server.num_workers - already_busy;
     if batch_size > available batch_size = available;
 
-    // Start or cycle progress
+    // Start or cycle progress handshake (begin follows client ack via pump).
     if server.deferred_processed == 0 {
         lock(*server.deferred_mutex);
         server.deferred_total = server.deferred_imports.count;
         unlock(*server.deferred_mutex);
         server.progress_cycle = 0;
-        send_progress_begin(tprint("jails-parse-%", server.progress_cycle), "Indexing",
+        progress_begin(tprint("jails-parse-%", server.progress_cycle), "Indexing",
             tprint("Parsing imports (%)", server.deferred_total));
     } else {
-        send_progress_end(tprint("jails-parse-%", server.progress_cycle), "");
+        progress_end(tprint("jails-parse-%", server.progress_cycle), "");
         server.progress_cycle += 1;
-        send_progress_begin(tprint("jails-parse-%", server.progress_cycle), "Indexing",
+        progress_begin(tprint("jails-parse-%", server.progress_cycle), "Indexing",
             tprint("Parsing imports (%)", server.deferred_processed, server.deferred_total));
     }
 
@@ -762,7 +883,7 @@ finish_analysis_if_complete :: () {
     if server.files_to_be_analyzed.count > 0 {
         process_analysis_step();  // kick off — processes first file
     } else {
-        send_progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
+        progress_end(tprint("jails-parse-%", server.progress_cycle), "Indexing complete");
         log("Background analysis complete");
     }
 }
@@ -890,6 +1011,7 @@ drain_completions :: () {
         lock(*server.task_queue_mutex);
         server.busy_workers -= count;
         unlock(*server.task_queue_mutex);
+        report_progress_percentage();
     }
 }
 
@@ -991,7 +1113,18 @@ drain_io_queue :: () {
 
         parseOK, request := json_parse_string(body, LSP_Request_Message,, temp);
         if !parseOK {
+            // Maybe a client response to our own request (create ack).
+            if handle_client_response(body) {
+                free(body);
+                continue;
+            }
             log_error("Unable to parse as json:\n%\n\n", body);
+            free(body);
+            continue;
+        }
+        if request.method.count == 0 {
+            // Response without method: route acks, drop the rest.
+            handle_client_response(body);
             free(body);
             continue;
         }
@@ -1038,6 +1171,7 @@ main :: () {
     log("Args are %", server.args);
 
     server.files_to_be_analyzed.allocator = context.default_allocator;
+    server.progress_tokens.allocator = context.default_allocator;
 
     // Async output queue — no mutex contention, flushed from scheduler loop
     server.output_queue.allocator = context.default_allocator;
@@ -1094,6 +1228,13 @@ main :: () {
         }
         array_free(server.task_queue);
 
+        for pt: server.progress_tokens {
+            if pt.token.count > 0 free(pt.token);
+            if pt.title.count > 0 free(pt.title);
+            if pt.message.count > 0 free(pt.message);
+        }
+        array_free(server.progress_tokens);
+
         destroy(*server.files_mutex);
         destroy(*server.deferred_mutex);
         destroy(*server.io_queue_mutex);
@@ -1142,6 +1283,9 @@ main :: () {
         }
 
         flush_output_queue();
+
+        // Deferred begin for acked progress tokens.
+        pump_progress_tokens();
 
         // Dispatch deferred imports to async worker pool
         // Workers carry their own shallow flag; scheduler never toggles it.

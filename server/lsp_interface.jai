@@ -452,6 +452,28 @@ send_progress_end :: (token: string, message := "") {
     lsp_send(notif);
 }
 
+// Server -> client request opening a progress token. The client acks with
+// {id, result} (or rejects with {id, error}); $/progress traffic for the
+// token must follow the ack. Outbound ids are negative so they never
+// collide with client request ids.
+LSP_Work_Done_Progress_Create :: struct {
+    using request: LSP_Request_Message;
+    method = "window/workDoneProgress/create";
+    params: struct {
+        token: string;
+    };
+}
+
+send_progress_create :: (token: string, id: s64) {
+    id_val: JSON_Value;
+    id_val.type = .NUMBER;
+    id_val.number = cast(float64) id;
+    req: LSP_Work_Done_Progress_Create;
+    req.id = id_val;
+    req.params.token = token;
+    lsp_send(req);
+}
+
 LSP_Work_Done_Progess_Params :: struct {
     workDoneToken: string; // 🛑 integer | string;
 }
